@@ -119,15 +119,18 @@ def loadBalancedDatasetesm3ae(configs):
 
     step_points = configs["augmentation"]["step_points"]
     crop = configs["augmentation"]["crop"]
-    maskp = [
-        (i, j)
-        for i, j in zip(
-            configs["augmentation"]["maskp"], configs["augmentation"]["maskpc"]
-        )
-    ]
+    maskp = configs["augmentation"]["maskp"]
+    maskpc = configs["augmentation"]["maskpc"]
+    mutate = configs["augmentation"]["mutate"]
+    mutatep = configs["augmentation"]["mutatep"]
     tracks = configs["augmentation"]["tracks"]
 
-    aug = VirusDataset.DataAugmentation(step_points, maskp, crop, lens, tracks)
+    aug = VirusDataset.DataAugmentation(
+        step_points, maskp, maskpc, crop, lens, mutate, mutatep, tracks=tracks
+    )
+
+    if "required_labels" not in configs["dataset"]:
+        configs["dataset"]["required_labels"] = []
 
     ds = VirusDataset.ESM3BalancedDataModule(
         datasets,
@@ -137,6 +140,7 @@ def loadBalancedDatasetesm3ae(configs):
         train_test_ratio=configs["dataset"]["train_test_ratio"],
         aug=aug,
         tracks=configs["dataset"]["tracks"],
+        required_labels=configs["dataset"]["required_labels"],
     )
     return ds
 
@@ -158,12 +162,23 @@ def loadDataset(configs) -> pytorch_lightning.LightningDataModule:
 
 
 def buildAutoEncoder(configs, model):
+    if "clf_params" not in configs["model"]:
+        configs["model"]["clf_params"] = {}
+
+    with open(configs["model"]["ori_seq"], "rb") as f:
+        ori_seqs = pickle.load(f)
+
     ae = modules.AutoEncoder(
         model,
         lr=configs["model"]["lr"],
         weight_decay=configs["model"]["weight_decay"],
         classes=configs["model"]["classes"],
+        clf_params=configs["model"]["clf_params"],
         masked_weight=configs["model"]["masked_weight"],
+        label_weights=configs["model"]["label_weights"],
+        ori_seqs=ori_seqs,
+        l=configs["model"]["l"][0],
+        tf=configs["model"]["teaching force"][0],
     )
     return ae
 

@@ -1,3 +1,4 @@
+import abc
 import os
 import random
 
@@ -8,30 +9,28 @@ from esm.utils.constants import esm3 as C
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import SubsetRandomSampler
 
-import ioutils
-
-mapping = {
-    "A": 0,
-    "C": 1,
-    "D": 2,
-    "E": 3,
-    "F": 4,
-    "G": 5,
-    "H": 6,
-    "I": 7,
-    "K": 8,
-    "L": 9,
-    "M": 10,
-    "N": 11,
-    "P": 12,
-    "Q": 13,
-    "R": 14,
-    "S": 15,
-    "T": 16,
-    "V": 17,
-    "W": 18,
-    "Y": 19,
-}
+seq_vocab = [
+    "A",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "K",
+    "L",
+    "M",
+    "N",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "V",
+    "W",
+    "Y",
+]
 
 
 class MyDataLoader(DataLoader):
@@ -42,71 +41,20 @@ class MyDataLoader(DataLoader):
         self.step_ds = step_ds
 
     def step(self):
+        # print("step dataset")
         if self.step_ds:
-            self.ds.newEpoch()
+            self.ds.step()
 
     def __iter__(self):
         self.epoch += 1
+        self.ds.newEpoch()
         if self.step_ds:
-            self.ds.step()
+            # self.ds.step()
             self.ds.ifaug = True
         else:
             self.ds.ifaug = False
         # print("now epoch ", self.epoch)
         return super().__iter__()
-
-
-def readVirusSequences(pos=None, trunc=1498, sample=300, seed=1509):
-    random.seed(seed)
-    print("read positive samples")
-    seqs = {}
-    if pos is None:
-        pos = os.listdir("/home/tyfei/datasets/ion_channel/Interprot/ion_channel/0.99")
-    for i in pos:
-        # print(i)
-        try:
-            if i.endswith(".fas"):
-                # print(i, i[:i.find(".")] in df["Accession"].values)
-                gen = ioutils.readFasta(
-                    "/home/tyfei/datasets/ion_channel/Interprot/ion_channel/0.99/" + i,
-                    truclength=trunc,
-                )
-                seqs[i[: i.find(".")]] = [i for i in gen]
-                # print(i, "success")
-        except:
-            pass
-            # print(i, "failed")
-
-    sequences = []
-    labels = []
-    for i in seqs:
-        sampled = random.sample(seqs[i], min(sample, len(seqs[i])))
-        sequences.extend(sampled)
-        labels.extend([1] * len(sampled))
-
-    print("read negative samples")
-    gen = ioutils.readFasta(
-        "/home/tyfei/datasets/ion_channel/Interprot/Negative_sample/old/decoy_1m_new_rmdup.fasta",
-        truclength=trunc,
-    )
-    seqs["neg"] = [i for i in gen]
-    sampled = random.sample(seqs["neg"], min(len(labels), len(seqs["neg"])))
-    sequences.extend(sampled)
-    labels.extend([0] * len(sampled))
-
-    print("read virus sequences")
-    allvirus = []
-    for i in os.listdir("/home/tyfei/datasets/NCBI_virus/genbank_csv/"):
-        try:
-            allvirus.extend(
-                ioutils.readNCBICsv(
-                    "/home/tyfei/datasets/NCBI_virus/genbank_csv/" + i, truclength=trunc
-                )
-            )
-        except Exception:
-            pass
-
-    return sequences, labels, allvirus
 
 
 MIN_LENGTH = 50
@@ -116,32 +64,67 @@ class DataAugmentation:
     def __init__(
         self,
         step_points: list,
-        maskp: list,
-        crop: list,
-        croprange: list,
-        tracks: list = None,
+        maskp: list = None,
+        maskpc: list = None,
+        crop: list = None,
+        croprange: list = None,
+        mutate: list = None,
+        mutatep: list = None,
+        vocab: list = None,
+        tracks: dict = {"seq_t": 1, "structure_t": 1, "sasa_t": 1, "second_t": 1},
     ) -> None:
-        assert len(step_points) == len(maskp)
-        assert len(maskp) == len(crop)
+        self.augs = {}
+        if maskp is not None:
+            assert len(step_points) == len(maskp)
+            # self.maskp = maskp
+            self.augs["maskp"] = maskp
+
+        if maskpc is not None:
+            assert len(step_points) == len(maskpc)
+            self.augs["maskpc"] = maskpc
+
+        if crop is not None:
+            assert len(step_points) == len(crop)
+            # self.crop = crop
+            self.augs["crop"] = crop
+
+        if mutate is not None:
+            assert len(step_points) == len(mutate)
+            assert mutatep is not None
+            self.augs["mutate"] = mutate
+
+        if mutatep is not None:
+            assert mutate is not None
+            assert len(step_points) == len(mutatep)
+            # self.mutatep = mutatep
+            self.augs["mutatep"] = mutatep
+
+        if vocab is None:
+            self.vocab = seq_vocab
+        else:
+            self.vocab = vocab
+
         self.tracks = tracks
-        if self.tracks == None:
-            self.tracks = {"seq_t": 1, "structure_t": 1, "sasa_t": 1, "second_t": 1}
+        # if self.tracks == None:
+        #     self.tracks = {"seq_t": 1, "structure_t": 1, "sasa_t": 1, "second_t": 1}
         self.step_points = step_points
-        self.maskp = maskp
-        self.crop = crop
+
         self.croprange = croprange
 
     def _getSettings(self, step):
-        maskp = (-1.0, -1.0)
-        crop = -1.0
+        ret = {}
+
+        for i in self.augs:
+            ret[i] = -1.0
         for i in range(len(self.step_points)):
             if step > self.step_points[i]:
-                maskp = self.maskp[i]
-                crop = self.crop[i]
-        return maskp, crop
+                for j in self.augs:
+                    ret[j] = self.augs[j][i]
 
-    def getAugmentation(self, seqlen, step):
-        maskp, crop = self._getSettings(step)
+        return ret
+
+    def getAugmentationParameters(self, seqlen, step):
+        ret = self._getSettings(step)
         rettrack = {}
         flag = 0
         for i in self.tracks:
@@ -155,31 +138,201 @@ class DataAugmentation:
 
         if flag == 0:
             rettrack["seq_t"] = True
-        if crop > 0:
+        if "mutate" in ret and ret["mutate"] > 0:
             t = random.random()
-            if t < crop:
-                sampledlen = random.sample(self.croprange, 1)[0]
-                sampledlen = int(sampledlen * np.random.uniform(0.8, 1.2))
-                sampledlen = MIN_LENGTH if sampledlen < MIN_LENGTH else sampledlen
-                sampledlen = min(sampledlen, seqlen - 2)
-                return maskp, sampledlen, rettrack
-        return maskp, -1, rettrack
+            if t < ret["mutate"]:
+                ret["mutate"] = 1.0
+            else:
+                ret["mutate"] = 0.0
+        if "crop" in ret and ret["crop"] > 0:
+            t = random.random()
+            if t < ret["crop"]:
+                if self.croprange is not None:
+                    sampledlen = random.sample(self.croprange, 1)[0]
+                    sampledlen = int(sampledlen * np.random.uniform(0.8, 1.2))
+                    sampledlen = MIN_LENGTH if sampledlen < MIN_LENGTH else sampledlen
+                    sampledlen = min(sampledlen, seqlen - 2)
+                    ret["crop"] = sampledlen
+                else:
+                    sampledlen = int(seqlen * np.random.uniform(0.3, 0.8))
+                    sampledlen = MIN_LENGTH if sampledlen < MIN_LENGTH else sampledlen
+                    sampledlen = min(sampledlen, seqlen - 2)
+                    ret["crop"] = sampledlen
+                return ret, rettrack
+
+        ret["crop"] = -1
+        return ret, rettrack
 
 
-class ESM3BaseDataset(Dataset):
+class BaseDataset(Dataset):
     def __init__(
-        self, tracks=["seq_t", "structure_t", "sasa_t", "second_t"], return_mask=False
+        self,
+        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        return_mask=False,
+        aug: DataAugmentation = None,
+        required_labels=[],
     ) -> None:
         assert len(tracks) > 0
         self.tracks = tracks
         self.step_cnt = 0
         self.return_mask = return_mask
+        self.aug = aug
+        self.ifaug = False
+        self.required_labels = required_labels
 
     def step(self):
         self.step_cnt += 1
 
     def resetCnt(self):
         self.step_cnt = 0
+
+    @abc.abstractmethod
+    def getToken(self, track, token):
+        pass
+
+    def _maskSequence(self, sample, pos):
+        for i in sample:
+            if not i.startswith("ori"):
+                sample[i][pos] = self.getToken(i, "mask")
+
+        return sample
+
+    def _generateMaskingPos(self, num, length, method="point"):
+        assert length > num + 5
+        if method == "point":
+            a = np.array(random.sample(range(length - 2), num)) + 1
+            return a
+        elif method == "block":
+            s = random.randint(1, length - num)
+            a = np.array(range(s, s + num))
+            return a
+        else:
+            raise NotImplementedError
+
+    def _cropSequence(self, sample, start, end):
+        for i in sample:
+            t = torch.zeros((end - start + 2), dtype=torch.long)
+            t[1:-1] = torch.tensor(sample[i][start:end])
+            t[0] = self.getToken(i, "start")
+            t[-1] = self.getToken(i, "end")
+            sample[i] = t
+        return sample
+
+    def _mutateSample(self, sample, pos):
+        for i in pos:
+            sample["seq_t"][i] = self.getToken(
+                "seq_t", random.sample(self.aug.vocab, 1)[0]
+            )
+
+        return sample
+
+    def _augmentSample(self, sample, aug_parameters, tracks=None):
+        ret = {}
+        ret["parameters"] = aug_parameters
+        ret["prot"] = sample["prot"]
+
+        if tracks is None:
+            tracks = self.tracks
+
+        retsample = {}
+        for i in tracks:
+            retsample[i] = sample[i].copy()
+
+        samplelen = len(sample[self.tracks[0]])
+
+        if aug_parameters["crop"] > MIN_LENGTH:
+            s = random.randint(1, samplelen - aug_parameters["crop"] - 1)
+            retsample = self._cropSequence(retsample, s, s + aug_parameters["crop"])
+            samplelen = aug_parameters["crop"] + 2
+
+        ret["parameters"]["mutated"] = 0.0
+        if "seq_t" in tracks and aug_parameters["mutate"] > 0.5:
+            num = np.random.binomial(samplelen - 2, aug_parameters["mutatep"])
+            pos = self._generateMaskingPos(num, samplelen)
+            if len(pos) > 0:
+                retsample = self._mutateSample(retsample, pos)
+                ret["parameters"]["mutated"] = 1.0
+
+        for i in tracks:
+            retsample["ori_" + i] = retsample[i].copy()
+
+        if self.return_mask:
+            mask = np.ones_like(retsample[self.tracks[0]], dtype=np.float32)
+
+        if aug_parameters["maskp"] > 0:
+            num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
+            pos = self._generateMaskingPos(num, samplelen)
+            if len(pos) > 0:
+                retsample = self._maskSequence(retsample, pos)
+            if self.return_mask:
+                mask[pos] = 0
+
+        if aug_parameters["maskpc"] > 0:
+            num = np.random.binomial(samplelen - 2, aug_parameters["maskpc"])
+            pos = self._generateMaskingPos(num, samplelen, "block")
+            if len(pos) > 0:
+                retsample = self._maskSequence(retsample, pos)
+            if self.return_mask:
+                mask[pos] = 0
+
+        if tracks is not None:
+            for i in tracks:
+                if not tracks[i]:
+                    sample.pop(i)
+
+        retsample["prot"] = sample["prot"]
+        ret["sample"] = retsample
+        if self.return_mask:
+            ret["mask"] = mask
+
+        return ret
+
+    def processSample(self, sample):
+        if self.aug is not None and self.ifaug:
+            aug_parameters, tracks = self.aug.getAugmentationParameters(
+                len(sample[self.tracks[0]]), self.step_cnt
+            )
+            ret = self._augmentSample(sample, aug_parameters, tracks)
+        else:
+            ret = {}
+            x1 = {}
+            for i in self.tracks:
+                x1[i] = sample[i]
+                x1["ori_" + i] = sample[i]
+
+            x1["prot"] = sample["prot"]
+            ret["parameters"] = {}
+            ret["sample"] = x1
+
+            if self.return_mask:
+                ret["mask"] = np.ones_like(x1[self.tracks[0]], dtype=np.float32)
+
+        return ret
+
+    def prepareLabels(self, sample, label):
+        labels = [label]
+        for i in self.required_labels:
+            if "classes" in sample and i in sample["sample"]["classes"]:
+                labels.append(sample["classes"][i])
+            else:
+                labels.append(-1)
+        return labels
+
+
+class ESM3BaseDataset(BaseDataset):
+    def __init__(
+        self,
+        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        return_mask=False,
+        aug: DataAugmentation = None,
+        required_labels=[],
+    ) -> None:
+        super().__init__(
+            tracks=tracks,
+            return_mask=return_mask,
+            aug=aug,
+            required_labels=required_labels,
+        )
 
     def getToken(self, track, token):
         # assert token in ["start", "end", "mask"]
@@ -219,7 +372,7 @@ class ESM3BaseDataset(Dataset):
                     case "second_t":
                         return C.SS8_UNK_TOKEN
                     case _:
-                        raise ValueError
+                        raise ValueError("mask of %s is not found" % track)
             case "pad":
                 match track:
                     case "seq_t":
@@ -237,211 +390,6 @@ class ESM3BaseDataset(Dataset):
                 assert token in C.SEQUENCE_VOCAB
                 return C.SEQUENCE_VOCAB.index(token)
 
-    def _maskSequence(self, sample, pos):
-        for i in sample:
-            sample[i][pos] = self.getToken(i, "mask")
-
-        return sample
-
-    def _generateMaskingPos(self, num, length, method="point"):
-        assert length > num + 5
-        if method == "point":
-            a = np.array(random.sample(range(length - 2), num)) + 1
-            return a
-        elif method == "block":
-            s = random.randint(1, length - num)
-            a = np.array(range(s, s + num))
-            return a
-        else:
-            raise NotImplementedError
-
-    def _cropSequence(self, sample, start, end):
-        for i in sample:
-            t = torch.zeros((end - start + 2), dtype=torch.long)
-            t[1:-1] = torch.tensor(sample[i][start:end])
-            t[0] = self.getToken(i, "start")
-            t[-1] = self.getToken(i, "end")
-            sample[i] = t
-        return sample
-
-    def _augmentsample(self, sample, maskp, crop, tracks=None):
-        samplelen = len(sample[self.tracks[0]])
-        if crop > 50:
-            s = random.randint(1, samplelen - crop - 1)
-            sample = self._cropSequence(sample, s, s + crop)
-            samplelen = crop + 2
-        if self.return_mask:
-            for i in sample:
-                mask = np.ones_like(sample[i], dtype=np.float32)
-                break
-
-        if maskp[0] > 0:
-            num = np.random.binomial(samplelen - 2, maskp[0])
-            pos = self._generateMaskingPos(num, samplelen)
-            if len(pos) > 0:
-                sample = self._maskSequence(sample, pos)
-            if self.return_mask:
-                mask[pos] = 0
-        if maskp[1] > 0:
-            num = np.random.binomial(samplelen - 2, maskp[0])
-            pos = self._generateMaskingPos(num, samplelen, "block")
-            if len(pos) > 0:
-                sample = self._maskSequence(sample, pos)
-            if self.return_mask:
-                mask[pos] = 0
-        if tracks is not None:
-            for i in tracks:
-                if not tracks[i]:
-                    sample.pop(i)
-        if self.return_mask:
-            return sample, mask
-        # print(tracks)
-        # print(sample)
-        return sample
-
-
-class ESM3MultiTrackBalancedDataset(ESM3BaseDataset):
-
-    def __init__(
-        self,
-        data1,
-        data2,
-        data3,
-        augment: DataAugmentation = None,
-        pos_neg_sample=None,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
-    ) -> None:
-        """_summary_
-
-        Args:
-            data1 (_type_): positive data
-            data2 (_type_): negative data
-            data3 (_type_): test data for domain adaptation
-            augment (DataAugmentation, optional): _description_. Defaults to None.
-            tracks (list, optional): _description_. Defaults to ["seq_t", "structure_t", "sasa_t", "second_t"].
-        """
-        super().__init__(tracks=tracks)
-        self.data1 = data1
-        self.data2 = data2
-        self.data3 = data3
-        self.aug = augment
-        self.iters = 0
-        self.data1order = []
-        self.data2order = []
-        self.data3order = np.arange(len(data3))
-        for i in data1:
-            self.data1order.append(np.arange(len(i)))
-        for i in data2:
-            self.data2order.append(np.arange(len(i)))
-        self.ifaug = False
-        if pos_neg_sample is not None:
-            self.pos_neg_sample = pos_neg_sample
-            for i, j in zip(self.pos_neg_sample, [self.data1, self.data2]):
-                for k in range(len(i)):
-                    if i[k] < 0:
-                        i[k] = len(j[k])
-        else:
-            self.pos_neg_sample = [[], []]
-            for i in self.data1:
-                self.pos_neg_sample[0].append(len(i))
-            for i in self.data2:
-                self.pos_neg_sample[1].append(len(i))
-
-        self._sample = True
-        # self.tracks = tracks
-
-    @property
-    def sample(self):
-        return self._sample
-
-    @sample.setter
-    def sample(self, v: bool):
-        assert isinstance(v, bool)
-        self._sample = v
-
-    def __len__(self):
-        if self._sample:
-            t = 0
-            for i in self.pos_neg_sample:
-                for j in i:
-                    t += j
-            return t
-        else:
-            t = 0
-            for i in self.data1:
-                t += len(i)
-            for i in self.data2:
-                t += len(i)
-            return t
-
-    def newEpoch(self):
-        for i in [self.data1order, self.data2order]:
-            for j in i:
-                random.shuffle(j)
-        random.shuffle(self.data3order)
-
-    def getOrigin(self):
-        ret = []
-        for i in range(len(self)):
-            t, _ = self._getitemx1(i)
-            ret.append(t["origin"])
-        return ret
-
-    def _getitemx1(self, idx):
-        if self.sample:
-            for i in range(len(self.pos_neg_sample[0])):
-                if idx - self.pos_neg_sample[0][i] < 0:
-                    return (
-                        self.data1[i][
-                            self.data1order[i][idx % len(self.data1order[i])]
-                        ],
-                        1,
-                    )
-                else:
-                    idx -= self.pos_neg_sample[0][i]
-            for i in range(len(self.pos_neg_sample[1])):
-                if idx - self.pos_neg_sample[1][i] < 0:
-                    return (
-                        self.data2[i][
-                            self.data2order[i][idx % len(self.data2order[i])]
-                        ],
-                        0,
-                    )
-                else:
-                    idx -= self.pos_neg_sample[1][i]
-        else:
-            for i in self.data1:
-                if idx - len(i) < 0:
-                    return i[idx], 1
-                else:
-                    idx -= len(i)
-            for i in self.data2:
-                if idx - len(i) < 0:
-                    return i[idx], 0
-                else:
-                    idx -= len(i)
-        raise KeyError
-
-    def _getitemx2(self, idx):
-        return self.data3[self.data3order[idx % len(self.data3)]]
-
-    def __getitem__(self, idx):
-        x1 = {}
-        x2 = {}
-        t1, label = self._getitemx1(idx)
-        t2 = self._getitemx2(idx)
-        for i in self.tracks:
-            x1[i] = t1[i]
-            x2[i] = t2[i]
-
-        if self.aug is not None and self.ifaug:
-            maskp, crop, tracks = self.aug.getAugmentation(
-                len(x1[self.tracks[0]]), self.step_cnt
-            )
-            x1 = self._augmentsample(x1, maskp, crop, tracks)
-
-        return x1, torch.tensor([label]), x2
-
 
 class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
 
@@ -452,6 +400,9 @@ class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
         sample_list=None,
         tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
         return_mask=True,
+        required_labels=[],
+        shuffle=False,
+        update_pnt=True,
     ) -> None:
         """_summary_
 
@@ -462,14 +413,22 @@ class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
             tracks (list, optional): _description_. Defaults to ["seq_t", "structure_t", "sasa_t", "second_t"].
             return_mask (bool, optional): _description_. Defaults to True.
         """
-        super().__init__(tracks=tracks, return_mask=return_mask)
+        super().__init__(
+            tracks=tracks,
+            return_mask=return_mask,
+            aug=augment,
+            required_labels=required_labels,
+        )
+        self.shuffle = shuffle
+        self.update_pnt = update_pnt
         self.data1 = data1
-        self.aug = augment
         self.iters = 0
         self.data1order = []
         for i in data1:
             self.data1order.append(np.arange(len(i)))
-        self.ifaug = False
+
+        self.ifaug = True
+
         if sample_list is not None:
             self.sample_list = sample_list
             for i in range(len(self.sample_list)):
@@ -481,6 +440,9 @@ class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
                 self.sample_list.append(len(i))
 
         self._sample = True
+
+        self.pnts1 = [0 for i in data1]
+
         # self.tracks = tracks
 
     @property
@@ -502,11 +464,21 @@ class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
             t = 0
             for i in self.data1:
                 t += len(i)
-            return t
+                return t
 
-    def newEpoch(self):
+    def shuffleIndex(self):
         for i in self.data1order:
             random.shuffle(i)
+
+    def newEpoch(self):
+        print("called new epoch")
+        if self.shuffle:
+            self.shuffleIndex()
+        if self.update_pnt:
+            for i in range(len(self.sample_list)):
+                self.pnts1[i] += self.sample_list[i]
+                while self.pnts1[i] >= len(self.data1order[i]):
+                    self.pnts1[i] -= len(self.data1order[i])
 
     def getOrigin(self):
         ret = []
@@ -536,23 +508,23 @@ class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
     def __getitem__(self, idx):
         x1 = {}
         t1 = self._getitemx1(idx)
-        for i in self.tracks:
-            x1[i] = t1[i]
 
-        if self.aug is not None and self.ifaug:
-            maskp, crop, tracks = self.aug.getAugmentation(
-                len(x1[self.tracks[0]]), self.step_cnt
-            )
-            x1_aug, mask = self._augmentsample(x1, maskp, crop, tracks)
+        x1 = self.processSample(t1)
+        if "mutated" in x1["parameters"]:
+            label = x1["parameters"]["mutated"]
         else:
-            x1_aug = x1
-            t = self.tracks[0]
-            mask = np.ones_like(x1[t], dtype=np.float32)
+            label = 0.0
+        labels = self.prepareLabels(t1, label)
 
-        return x1_aug, t1["seq_t"], mask
+        s = x1["sample"]
+        # s["prot"] = x1["prot"]
+        s["mask"] = x1["mask"]
+
+        return s, labels
 
 
 class ESM3MultiTrackDataset(ESM3BaseDataset):
+
     def __init__(
         self,
         data1,
@@ -608,6 +580,7 @@ class ESM3BalancedDataModule(L.LightningDataModule):
         aug=None,
         seed=1509,
         tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        required_labels=[],
     ):
         super().__init__()
         self.value = 0
@@ -640,6 +613,7 @@ class ESM3BalancedDataModule(L.LightningDataModule):
             augment=aug,
             sample_list=sample_train,
             tracks=tracks,
+            required_labels=required_labels,
         )
 
         self.val_set = ESM3MultiTrackAutoEncoderDataset(
@@ -647,6 +621,7 @@ class ESM3BalancedDataModule(L.LightningDataModule):
             augment=aug,
             sample_list=sample_val,
             tracks=tracks,
+            required_labels=required_labels,
         )
 
     def train_dataloader(self):

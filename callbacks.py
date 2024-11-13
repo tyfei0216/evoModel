@@ -9,24 +9,15 @@ from torch.utils import tensorboard
 
 
 class LambdaUpdate(L.Callback):
-    def __init__(self, warmup=5000, check=3000):
+    def __init__(self, warmup=5000, check=3000, l=[1.0], tf=[0.0]):
         self.warmup = warmup
         self.check = check
-        self.acc = torchmetrics.Accuracy(task="binary")
+        self.lp = 0
+        self.tfp = 0
+        self.l = l
+        self.tf = tf
 
         self.cnt = 0
-        self.outputs = []
-
-    def on_train_batch_end(
-        self,
-        trainer: L.Trainer,
-        pl_module: L.LightningModule,
-        outputs: torch.Tensor | Mapping[str, Any] | None,
-        batch: torch.Any,
-        batch_idx: int,
-    ) -> None:
-        self.outputs.append(pl_module.training_step_outputs[-1])
-        # return super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
 
     def on_before_optimizer_step(
         self, trainer: L.Trainer, pl_module: L.LightningModule, optimizer: Optimizer
@@ -38,12 +29,19 @@ class LambdaUpdate(L.Callback):
 
         if self.cnt == self.check:
             self.cnt = 0
-            scores = torch.concatenate([x["y"] for x in self.outputs])
-            y = torch.concatenate([x["true_label"] for x in self.outputs])
+            self.lp += 1
+            self.lp = min(len(self.l) - 1, self.lp)
+            self.tfp += 1
+            self.tfp = min(len(self.tf) - 1, self.tfp)
+            pl_module.l = self.l[self.lp]
+            pl_module.tf = self.tf[self.tfp]
 
-            self.outputs.clear()
-            acc = self.acc(scores, y)
-            pl_module.updateLambda(acc)
+            # scores = torch.concatenate([x["y"] for x in self.outputs])
+            # y = torch.concatenate([x["true_label"] for x in self.outputs])
+
+            # self.outputs.clear()
+            # acc = self.acc(scores, y)
+            # pl_module.updateLambda(acc)
         # return super().on_before_optimizer_step(trainer, pl_module, optimizer)
 
 
@@ -145,7 +143,7 @@ def getCallbacks(configs, args) -> List[L.Callback]:
         k = configs["train"]["save"]
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="validate_loss",  # Replace with your validation metric
+        monitor="epoch_validate_loss",  # Replace with your validation metric
         mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
         save_top_k=k,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training
@@ -153,6 +151,16 @@ def getCallbacks(configs, args) -> List[L.Callback]:
         filename="{epoch}-{validate_loss:.2f}",  # Checkpoint file naming pattern
     )
     ret.append(checkpoint_callback)
+
+    if "strategy" in configs["model"]:
+        print("build lambda update callback")
+        lu = LambdaUpdate(
+            warmup=configs["model"]["strategy"]["warmup"],
+            check=configs["model"]["strategy"]["step"],
+            l=configs["model"]["l"],
+            tf=configs["model"]["teaching force"],
+        )
+        ret.append(lu)
 
     if "augmentation" in configs:
         print("build data augmentation callback")

@@ -1,3 +1,5 @@
+import random
+
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
@@ -80,11 +82,11 @@ class Linearcls(nn.Module):
     """
 
     def __init__(
-        self, input_dim=1536, take_embed="first", dropout=-1, p0=None, output_dim=1
+        self, input_dim=256, take_embed="first", dropout=-1, p0=None, output_dim=1
     ):
         super().__init__()
 
-        assert take_embed in ["first", "mean", "max"]
+        assert take_embed in ["first", "mean", "max", "last"]
         self.embed_dim = input_dim
         self.dropout = dropout
         self.take_embed = take_embed
@@ -114,6 +116,10 @@ class Linearcls(nn.Module):
         elif self.take_embed == "max":
             x = x.transpose(1, 2)
             x = F.adaptive_max_pool1d(x, 1)
+        elif self.take_embed == "last":
+            x = x[:, -1]
+        else:
+            raise NotImplementedError
 
         if self.p0 is not None:
             x = self.p0(x)
@@ -142,6 +148,10 @@ class CrossGeneModel(L.LightningModule):
         seq=["Mprot", "E", "Spike"],
         weight_decay=0.0,
         lr=1e-4,
+        clf_params={},
+        only_embed=False,
+        label_weights=None,
+        l=1.0,
     ):
         super().__init__()
 
@@ -156,13 +166,22 @@ class CrossGeneModel(L.LightningModule):
         self.decoder_block = nn.ModuleList(
             [SelfAttention(in_channels, n_head) for i in range(transformer_layers)]
         )
+        self.cri = nn.MSELoss()
+        self.cri2 = nn.BCEWithLogitsLoss(weight=torch.tensor(label_weights))
+        self.clf = Linearcls(**clf_params)
+        self.only_embed = only_embed
 
-        self.cls = Linearcls(in_channels)
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+        self.l = l
 
     def forward(self, x):
         inputs = []
         for i in self.seq:
+            if x[i].dim() == 1:
+                x[i] = x[i].unsqueeze(0)
             inputs.append(x[i])
+
         inputs.append(torch.zeros_like(inputs[-1]))
 
         inputs = torch.stack(inputs, dim=1)
@@ -170,7 +189,124 @@ class CrossGeneModel(L.LightningModule):
         for block in self.encoder_blocks:
             inputs = block(inputs)
 
-        clsres = self.cls(inputs)
+        embed = inputs[:, -1, :]
+
+        clsres = self.clf(inputs)
+
+        if self.only_embed:
+            return embed
+
+        x = embed[:, None].repeat(1, len(self.seq), 1)
+        for block in self.decoder_block:
+            x = block(inputs)
+
+        return embed, x, clsres
+
+    def _common_training_step(self, input_dict, y, mask, labels=None):
+        if isinstance(labels, list):
+            labels = labels[0]
+        self.only_embed = False
+        _, x, res = self.forward(input_dict)
+        x = x.view(-1, x.shape[-1])
+        y = y.flatten()
+        mask = mask.flatten()
+        mask = 1 - mask
+        mask += self.masked_weight
+        x = x - y
+        x = x * mask
+        loss1 = self.cri(x, torch.zeros_like(x))
+
+        if labels is not None:
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            loss2 = self.cri2(res, labels)
+        else:
+            loss2 = 0
+        loss = loss1 + self.l * loss2
+        # print(loss.shape, loss)
+        # exit()
+        return loss, loss1, loss2
+
+    def training_step(self, batch, batch_idx):
+        input_dict, y, mask, labels = batch
+        # y = input_dict["ori_seq_t"]
+        # mask = input_dict["mask"]
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
+        self.training_step_outputs.append(
+            {
+                "total loss": loss.detach().cpu(),
+                "predict loss": loss2.detach().cpu(),
+                "reconstruct loss": loss1.detach().cpu(),
+            }
+        )
+        self.log("train_loss:", loss, prog_bar=True)
+        self.log("predict loss:", loss2, prog_bar=False)
+        self.log("reconstruct loss:", loss1, prog_bar=False)
+        return loss
+
+    def _common_epoch_end(self, outputs):
+
+        if len(outputs) == 0:
+            return 0, 0, 0
+
+        loss = torch.stack([i["total loss"] for i in outputs]).mean()
+        loss1 = torch.stack([i["reconstruct loss"] for i in outputs]).mean()
+        loss2 = torch.stack([i["predict loss"] for i in outputs]).mean()
+        outputs.clear()
+        # print(loss, loss1, loss2)
+        return loss, loss1, loss2
+
+    def on_training_epoch_end(self):
+
+        loss, loss1, loss2 = self._common_epoch_end(self.training_step_outputs)
+
+        print("finish training epoch, loss %f" % loss)
+        # self.log_dict(
+        #     {
+        #         "epoch_train_loss": loss,
+        #     },
+        #     on_step=False,
+        #     on_epoch=True,
+        #     prog_bar=True,
+        # )
+
+    def on_validation_epoch_end(self):
+        loss, loss1, loss2 = self._common_epoch_end(self.validation_step_outputs)
+        print("finish validating, loss %f" % (loss))
+        self.log_dict(
+            {
+                "epoch_validate_loss": loss1 + loss2,
+                "epoch_validate_reconstruct_loss": loss1,
+                "epoch_validate_predict_loss": loss2,
+            },
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
+
+    def validation_step(self, batch, batch_idx):
+
+        input_dict, y, mask, labels = batch
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
+        # self.validation_s
+
+        return loss
+
+    def on_save_checkpoint(self, checkpoint):
+        backbones = []
+        for i in checkpoint["state_dict"]:
+            if "esm" in i and "lora" not in i:
+                backbones.append(i)
+        for i in backbones:
+            del checkpoint["state_dict"][i]
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.parameters()),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        return optimizer
 
 
 class AutoEncoder(L.LightningModule):
@@ -184,7 +320,12 @@ class AutoEncoder(L.LightningModule):
         only_embed=True,
         weight_decay=0.0,
         classes=33,
+        clf_params={},
+        label_weights=None,
         masked_weight=0.1,
+        l=1.0,
+        tf=0.5,
+        ori_seqs={},
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["esm_model"])
@@ -192,6 +333,7 @@ class AutoEncoder(L.LightningModule):
         self.bottleneck = nn.Linear(in_channels, out_channels)
 
         self.decoder = DecoderBlock(out_channels, n_head, classes)
+        self.clf = Linearcls(**clf_params)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -199,13 +341,25 @@ class AutoEncoder(L.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.cri = nn.CrossEntropyLoss(reduction="none")
+
+        self.cri2 = nn.BCEWithLogitsLoss(weight=torch.tensor(label_weights))
         self.only_embed = only_embed
         self.masked_weight = masked_weight
 
         self.training_step_outputs = []
         self.validation_step_outputs = []
+        self.l = l
+        self.tf = tf
+        self.ori_seqs = {}
+        for i in ori_seqs:
+            t = torch.tensor(ori_seqs[i], requires_grad=False)
+            self.ori_seqs[i] = t
+            self.register_buffer("ori_seq_" + i, t)
+        self.embed = nn.Embedding(classes, out_channels)
 
     def forward(self, input_dict):
+        prot = input_dict["prot"]
+        # print(prot)
         for i in ["seq_t", "structure_t", "ss8_t", "sasa_t"]:
             if i not in input_dict:
                 input_dict[i] = None
@@ -224,72 +378,112 @@ class AutoEncoder(L.LightningModule):
 
         batchsize, length, channels = x.shape
 
-        embed = x[:, 0]
+        embed = self.bottleneck(x)
 
-        embed = self.bottleneck(embed)
+        res = self.clf(embed)
+
+        embed = embed[:, 0]
 
         if self.only_embed:
             return embed
 
         x = embed[:, None, :].repeat(1, length, 1)
-        x = self.decoder(x)
-        return embed, x
+        if self.tf > 0 and random.random() < self.tf:
+            q = []
+            for i in prot:
+                q.append(getattr(self, "ori_seq_" + i))
+            q = torch.stack(q)
+            q = self.embed(q)
+            if q.dim() == 2:
+                q = q.unsqueeze(0)
+            # print(q.shape, x.shape)
+            l = min(x.shape[1], q.shape[1])
+            x[:, :l, :] += q[:, :l, :]
 
-    def _common_training_step(self, input_dict, y, mask):
+        # print(x.shape)
+
+        x = self.decoder(x)
+        return embed, x, res
+
+    def _common_training_step(self, input_dict, y, mask, labels=None):
+        if isinstance(labels, list):
+            labels = labels[0]
         self.only_embed = False
-        _, x = self.forward(input_dict)
+        _, x, res = self.forward(input_dict)
         x = x.view(-1, x.shape[-1])
         y = y.flatten()
         mask = mask.flatten()
         mask = 1 - mask
         mask += self.masked_weight
         loss = self.cri(x, y)
+        if labels is not None:
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            loss2 = self.cri2(res, labels)
+        else:
+            loss2 = 0
         # print(loss.shape, mask.shape)
         loss = loss * mask
         # print(loss.shape)
-        loss = loss.sum() / mask.sum()
+        loss1 = loss.sum() / mask.sum()
+        loss = loss1 + self.l * loss2
         # print(loss.shape, loss)
         # exit()
-        return loss
+        return loss, loss1, loss2
 
     def training_step(self, batch, batch_idx):
-        input_dict, y, mask = batch
-        loss = self._common_training_step(input_dict, y, mask)
-        self.training_step_outputs.append(loss.detach().cpu())
+        input_dict, labels = batch
+        y = input_dict["ori_seq_t"]
+        mask = input_dict["mask"]
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
+        self.training_step_outputs.append(
+            {
+                "total loss": loss.detach().cpu(),
+                "predict loss": loss2.detach().cpu(),
+                "reconstruct loss": loss1.detach().cpu(),
+            }
+        )
         self.log("train_loss:", loss, prog_bar=True)
+        self.log("predict loss:", loss2, prog_bar=False)
+        self.log("reconstruct loss:", loss1, prog_bar=False)
         return loss
 
     def _common_epoch_end(self, outputs):
 
         if len(outputs) == 0:
-            return 0
-        loss = torch.stack(outputs).mean()
+            return 0, 0, 0
 
+        loss = torch.stack([i["total loss"] for i in outputs]).mean()
+        loss1 = torch.stack([i["reconstruct loss"] for i in outputs]).mean()
+        loss2 = torch.stack([i["predict loss"] for i in outputs]).mean()
         outputs.clear()
-        return loss
+        # print(loss, loss1, loss2)
+        return loss, loss1, loss2
 
     def on_training_epoch_end(self):
 
-        loss = self._common_epoch_end(self.training_step_outputs)
+        loss, loss1, loss2 = self._common_epoch_end(self.training_step_outputs)
 
         print("finish training epoch, loss %f" % loss)
-        self.log_dict(
-            {
-                "train_loss": loss,
-            },
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-        )
+        # self.log_dict(
+        #     {
+        #         "epoch_train_loss": loss,
+        #     },
+        #     on_step=False,
+        #     on_epoch=True,
+        #     prog_bar=True,
+        # )
 
         self.last_train_step = 0
 
     def on_validation_epoch_end(self):
-        loss = self._common_epoch_end(self.validation_step_outputs)
+        loss, loss1, loss2 = self._common_epoch_end(self.validation_step_outputs)
         print("finish validating, loss %f" % (loss))
         self.log_dict(
             {
-                "validate_loss": loss,
+                "epoch_validate_loss": loss1 + loss2,
+                "epoch_validate_reconstruct_loss": loss1,
+                "epoch_validate_predict_loss": loss2,
             },
             on_step=False,
             on_epoch=True,
@@ -297,9 +491,13 @@ class AutoEncoder(L.LightningModule):
         )
 
     def validation_step(self, batch, batch_idx):
-        input_dict, y, mask = batch
-        loss = self._common_training_step(input_dict, y, mask)
-        self.validation_step_outputs.append(loss.detach().cpu())
+
+        input_dict, labels = batch
+        y = input_dict["ori_seq_t"]
+        mask = input_dict["mask"]
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
+        # self.validation_s
+
         return loss
 
     def on_save_checkpoint(self, checkpoint):
