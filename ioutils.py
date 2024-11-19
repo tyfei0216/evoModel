@@ -3,7 +3,7 @@ from datetime import date
 
 import pandas as pd
 
-re1 = re.compile(r"[-*\s]")
+re1 = re.compile(r"[*\s]")
 re2 = re.compile(r"[-* Xx.\s]")
 re3 = re.compile(r"^[ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwyXx -*.]*$")
 re4 = re.compile(r"[^ACDEFGHIKLMNPQRSTVWYacdefghiklmnpqrstvwy]")

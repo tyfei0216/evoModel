@@ -49,10 +49,11 @@ def run():
     print("start training")
 
     if args.checkpoint is not None:
+        model.strict_loading = False
         trainer.fit(model, ds, ckpt_path=args.checkpoint)
     else:
         trainer.fit(model, ds)
-    torch.save(model.state_dict(), path + "parms.pt")
+    # torch.save(model.state_dict(), path + "parms.pt")
 
 
 if __name__ == "__main__":

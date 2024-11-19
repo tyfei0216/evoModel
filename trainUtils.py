@@ -13,6 +13,7 @@ from torch.utils import tensorboard
 
 import callbacks
 import modules
+import VirusDataset
 
 
 def loadesm3(configs):
@@ -22,18 +23,26 @@ def loadesm3(configs):
     model = modules.fixParameters(
         model, unfix=configs["pretrain_model"]["unfix_layers"]
     )
+    q = [
+        "transformer.blocks." + str(s) + "."
+        for s in configs["pretrain_model"]["add_lora"]
+    ]
     model = modules.addlora(
         model,
-        layers=configs["pretrain_model"]["add_lora"],
+        layers=q,
         ranks=configs["pretrain_model"]["rank"],
         alphas=configs["pretrain_model"]["alpha"],
     )
     return model
 
 
+def loadNone(config):
+    return None
+
+
 LOAD_PRETRAIN = {
     "esm3": loadesm3,
-    # "esm3": loadesm3,
+    "None": loadNone,
 }
 
 
@@ -102,7 +111,6 @@ def loadDatasetesm3(configs):
 
 
 def loadBalancedDatasetesm3ae(configs):
-    import VirusDataset
 
     datasets = []
     lens = []
@@ -145,15 +153,36 @@ def loadBalancedDatasetesm3ae(configs):
     return ds
 
 
+def loadStage2Dataset(configs):
+    with open(configs["dataset"]["path"], "rb") as f:
+        t = pickle.load(f)
+
+    ds = VirusDataset.Stage2DataModule(
+        data=t,
+        batch_size=configs["train"]["batch_size"],
+        validate_size=configs["dataset"]["dataset_val_sample"],
+        seed=configs["dataset"]["seed"],
+        seq=configs["dataset"]["seq"],
+        required_labels=configs["dataset"]["required_labels"],
+        mask=configs["dataset"]["mask"],
+        maskp=configs["dataset"]["maskp"],
+    )
+
+    return ds
+
+
 LOAD_DATASET = {
     "esm3ae": loadBalancedDatasetesm3ae,
+    "esm3cg": loadStage2Dataset,
 }
 
 
 def loadDataset(configs) -> pytorch_lightning.LightningDataModule:
-    dataset = "esm2"
+    # dataset = "esm2"
     if "dataset" in configs:
         dataset = configs["dataset"]["type"]
+    else:
+        raise ValueError("dataset type not given")
 
     if dataset in LOAD_DATASET:
         return LOAD_DATASET[dataset](configs)
@@ -168,9 +197,13 @@ def buildAutoEncoder(configs, model):
     with open(configs["model"]["ori_seq"], "rb") as f:
         ori_seqs = pickle.load(f)
 
+    if "lr_backbone" not in configs["model"]:
+        configs["model"]["lr_backbone"] = None
+
     ae = modules.AutoEncoder(
         model,
         lr=configs["model"]["lr"],
+        lr_backbone=configs["model"]["lr_backbone"],
         weight_decay=configs["model"]["weight_decay"],
         classes=configs["model"]["classes"],
         clf_params=configs["model"]["clf_params"],
@@ -183,13 +216,20 @@ def buildAutoEncoder(configs, model):
     return ae
 
 
-def buildFullModel(configs, model):
-    raise NotImplementedError
+def buildCrossGeneModel(configs, model=None):
+    model = modules.CrossGeneModel(
+        in_channels=configs["model"]["in_channels"],
+        lr=configs["model"]["lr"],
+        weight_decay=configs["model"]["weight_decay"],
+        masked_weight=configs["model"]["masked_weight"],
+        seq=configs["model"]["seq"],
+    )
+    return model
 
 
 BUILD_MODEL = {
     "stage1": buildAutoEncoder,
-    "stage2": buildFullModel,
+    "stage2": buildCrossGeneModel,
     # "esm3": buildesm3Model,
 }
 
@@ -217,6 +257,8 @@ def buildModel(
             model.load_freeze = [
                 configs["pretrain_model"]["unfreeze"]["layers"][i] for i in idx
             ]
+    else:
+        model.load_freeze = None
 
     return model
 
@@ -257,6 +299,7 @@ def buildTrainer(configs, args):
         devices=args.devices,
         max_epochs=configs["train"]["epoch"],
         log_every_n_steps=1,
+        val_check_interval=configs["train"]["val_check_interval"],
         gradient_clip_val=configs["train"]["gradient_clip_val"],
         accumulate_grad_batches=configs["train"]["accumulate_grad_batches"],
         callbacks=cbs,

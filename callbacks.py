@@ -109,6 +109,7 @@ class FinetuneUpdates(BaseFinetuning):
                 modules=update,
                 optimizer=trainer.optimizers[0],
             )
+            print("now: ", trainer.optimizers[0].state_dict()["param_groups"][-1])
             # module_path = "esm_model.transformer.blocks.47.ffn.3.lora"
             # submodule = pl_module
             # tokens = module_path.split(".")
@@ -148,7 +149,7 @@ def getCallbacks(configs, args) -> List[L.Callback]:
         save_top_k=k,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training
         dirpath=args.path,  # Directory where the checkpoints will be saved
-        filename="{epoch}-{validate_loss:.2f}",  # Checkpoint file naming pattern
+        filename="{epoch}-{epoch_validate_loss:.2f}",  # Checkpoint file naming pattern
     )
     ret.append(checkpoint_callback)
 
@@ -175,6 +176,13 @@ def getCallbacks(configs, args) -> List[L.Callback]:
                     iters=configs["pretrain_model"]["unfreeze"]["steps"],
                     unfreeze_layers=configs["pretrain_model"]["unfreeze"]["layers"],
                 )
+                ret.append(ft)
+            else:
+                ft = FinetuneUpdates(
+                    iters=configs["pretrain_model"]["unfreeze"]["steps"],
+                    unfreeze_layers=configs["pretrain_model"]["unfreeze"]["layers"],
+                )
+                ft.cnt = configs["pretrain_model"]["unfreeze"]["steps"][-1] + 100
                 ret.append(ft)
 
     return ret

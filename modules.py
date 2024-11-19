@@ -56,20 +56,23 @@ class SelfAttention(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, channels, n_head, classes):
+    def __init__(self, channels, n_head, classes, transformer_layers=3):
         super(DecoderBlock, self).__init__()
         self.channels = channels
         self.n_head = n_head
         self.classes = classes
-        self.T1 = SelfAttention(channels, n_head)
-        self.T2 = SelfAttention(channels, n_head)
-        self.T3 = SelfAttention(channels, n_head)
+
+        self.transformer_blocks = nn.ModuleList(
+            [SelfAttention(channels, n_head) for i in range(transformer_layers)]
+        )
+        # self.T1 = SelfAttention(channels, n_head)
+        # self.T2 = SelfAttention(channels, n_head)
+        # self.T3 = SelfAttention(channels, n_head)
         self.clf = nn.Linear(channels, classes)
 
     def forward(self, x):
-        x = self.T1(x)
-        x = self.T2(x)
-        x = self.T3(x)
+        for block in self.encoder_blocks:
+            x = block(x)
         x = self.clf(x)
         return x
 
@@ -145,8 +148,9 @@ class CrossGeneModel(L.LightningModule):
         in_channels=256,
         transformer_layers=5,
         n_head=16,
-        seq=["Mprot", "E", "Spike"],
+        seq=["NSP5", "E", "S"],
         weight_decay=0.0,
+        masked_weight=0.1,
         lr=1e-4,
         clf_params={},
         only_embed=False,
@@ -159,6 +163,8 @@ class CrossGeneModel(L.LightningModule):
         self.weight_decay = weight_decay
         self.lr = lr
 
+        # print(in_channels, n_head)
+
         self.encoder_blocks = nn.ModuleList(
             [SelfAttention(in_channels, n_head) for i in range(transformer_layers)]
         )
@@ -167,13 +173,17 @@ class CrossGeneModel(L.LightningModule):
             [SelfAttention(in_channels, n_head) for i in range(transformer_layers)]
         )
         self.cri = nn.MSELoss()
-        self.cri2 = nn.BCEWithLogitsLoss(weight=torch.tensor(label_weights))
+        if label_weights is not None:
+            self.cri2 = nn.BCEWithLogitsLoss(weight=torch.tensor(label_weights))
+        else:
+            self.cri2 = nn.BCEWithLogitsLoss()
         self.clf = Linearcls(**clf_params)
         self.only_embed = only_embed
 
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.l = l
+        self.masked_weight = masked_weight
 
     def forward(self, x):
         inputs = []
@@ -197,9 +207,10 @@ class CrossGeneModel(L.LightningModule):
             return embed
 
         x = embed[:, None].repeat(1, len(self.seq), 1)
+        # print(x.shape)
         for block in self.decoder_block:
-            x = block(inputs)
-
+            x = block(x)
+        # print(x.shape)
         return embed, x, clsres
 
     def _common_training_step(self, input_dict, y, mask, labels=None):
@@ -207,35 +218,61 @@ class CrossGeneModel(L.LightningModule):
             labels = labels[0]
         self.only_embed = False
         _, x, res = self.forward(input_dict)
-        x = x.view(-1, x.shape[-1])
+        # print(x.shape, y.shape)
+        x = x.flatten()
         y = y.flatten()
         mask = mask.flatten()
         mask = 1 - mask
+        mask[mask < 0] = -self.masked_weight
         mask += self.masked_weight
         x = x - y
         x = x * mask
         loss1 = self.cri(x, torch.zeros_like(x))
 
-        if labels is not None:
+        if labels.shape[1] != 0:
             if labels.dim() == 1:
                 labels = labels.unsqueeze(0)
             loss2 = self.cri2(res, labels)
         else:
-            loss2 = 0
+            loss2 = 0.0
         loss = loss1 + self.l * loss2
         # print(loss.shape, loss)
         # exit()
         return loss, loss1, loss2
 
+    def _parseBatch(self, batch):
+        input_dict, mask, labels = batch
+        y = []
+        for i in self.seq:
+            if input_dict["ori_" + i].dim() == 1:
+                input_dict["ori_" + i] = input_dict["ori_" + i].unsqueeze(0)
+            y.append(input_dict["ori_" + i])
+        y = torch.stack(y, dim=1)
+
+        masks = []
+        for i in self.seq:
+            if mask[i].dim() == 1:
+                mask[i] = mask[i].unsqueeze(0)
+            masks.append(mask[i])
+
+        masks = torch.stack(masks, dim=1)
+
+        return input_dict, y, masks, labels
+
     def training_step(self, batch, batch_idx):
-        input_dict, y, mask, labels = batch
-        # y = input_dict["ori_seq_t"]
+
+        input_dict, y, masks, labels = self._parseBatch(batch)
+
         # mask = input_dict["mask"]
-        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, masks, labels)
+        if not isinstance(loss2, float):
+            loss2 = loss2.detach().cpu()
+        else:
+            loss2 = torch.tensor([0.0])
         self.training_step_outputs.append(
             {
                 "total loss": loss.detach().cpu(),
-                "predict loss": loss2.detach().cpu(),
+                "predict loss": loss2,
                 "reconstruct loss": loss1.detach().cpu(),
             }
         )
@@ -286,9 +323,20 @@ class CrossGeneModel(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
 
-        input_dict, y, mask, labels = batch
-        loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
-        # self.validation_s
+        input_dict, y, masks, labels = self._parseBatch(batch)
+
+        loss, loss1, loss2 = self._common_training_step(input_dict, y, masks, labels)
+        if not isinstance(loss2, float):
+            loss2 = loss2.detach().cpu()
+        else:
+            loss2 = torch.tensor([0.0])
+        self.validation_step_outputs.append(
+            {
+                "total loss": loss.detach().cpu(),
+                "predict loss": loss2,
+                "reconstruct loss": loss1.detach().cpu(),
+            }
+        )
 
         return loss
 
@@ -301,11 +349,36 @@ class CrossGeneModel(L.LightningModule):
             del checkpoint["state_dict"][i]
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
+
+        print("get training optimizer")
+        if self.load_freeze is None:
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, self.parameters()),
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            l1 = []
+            for i, j in self.named_parameters():
+                if "esm" not in j:
+                    l1.append(j)
+            optimizer = torch.optim.Adam(
+                l1,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+            for need in self.load_freeze:
+                params = []
+                for i, j in self.named_parameters():
+                    flag = 1
+                    for k in need:
+                        if k not in i:
+                            flag = 0
+                            break
+                    if flag == 1:
+                        params.append(j)
+                optimizer.add_param_group({"params": params, "lr": self.lr})
+
         return optimizer
 
 
@@ -317,6 +390,7 @@ class AutoEncoder(L.LightningModule):
         out_channels=256,
         n_head=16,
         lr=1e-4,
+        lr_backbone=1e-5,
         only_embed=True,
         weight_decay=0.0,
         classes=33,
@@ -339,6 +413,7 @@ class AutoEncoder(L.LightningModule):
         self.out_channels = out_channels
         self.n_head = n_head
         self.lr = lr
+        self.lr_backbone = lr_backbone
         self.weight_decay = weight_decay
         self.cri = nn.CrossEntropyLoss(reduction="none")
 
@@ -414,6 +489,7 @@ class AutoEncoder(L.LightningModule):
         y = y.flatten()
         mask = mask.flatten()
         mask = 1 - mask
+        mask[mask < 0] = -self.masked_weight
         mask += self.masked_weight
         loss = self.cri(x, y)
         if labels is not None:
@@ -434,7 +510,7 @@ class AutoEncoder(L.LightningModule):
     def training_step(self, batch, batch_idx):
         input_dict, labels = batch
         y = input_dict["ori_seq_t"]
-        mask = input_dict["mask"]
+        mask = input_dict["mask"].float()
         loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
         self.training_step_outputs.append(
             {
@@ -451,6 +527,7 @@ class AutoEncoder(L.LightningModule):
     def _common_epoch_end(self, outputs):
 
         if len(outputs) == 0:
+
             return 0, 0, 0
 
         loss = torch.stack([i["total loss"] for i in outputs]).mean()
@@ -494,9 +571,16 @@ class AutoEncoder(L.LightningModule):
 
         input_dict, labels = batch
         y = input_dict["ori_seq_t"]
-        mask = input_dict["mask"]
+        mask = input_dict["mask"].float()
+
         loss, loss1, loss2 = self._common_training_step(input_dict, y, mask, labels)
-        # self.validation_s
+        self.validation_step_outputs.append(
+            {
+                "total loss": loss.detach().cpu(),
+                "predict loss": loss2.detach().cpu(),
+                "reconstruct loss": loss1.detach().cpu(),
+            }
+        )
 
         return loss
 
@@ -509,11 +593,66 @@ class AutoEncoder(L.LightningModule):
             del checkpoint["state_dict"][i]
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.parameters()),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
+
+        print("get training optimizer")
+
+        if self.lr_backbone is not None:
+            l1 = []
+            l2 = []
+            for i, j in self.named_parameters():
+                if j.requires_grad:
+                    if "esm" in i:
+                        l1.append(j)
+                    else:
+                        l2.append(j)
+
+            param_dicts = [
+                {
+                    "params": l1,
+                    "lr": self.lr_backbone,
+                },
+                {
+                    "params": l2,
+                    "lr": self.lr,
+                },
+            ]
+            return torch.optim.Adam(param_dicts, weight_decay=self.weight_decay)
+
+        if self.load_freeze is None:
+            t = []
+            for i, j in self.named_parameters():
+                if j.requires_grad:
+                    print(i)
+                    t.append(j)
+            optimizer = torch.optim.Adam(
+                t,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            l1 = []
+            for i, j in self.named_parameters():
+                if "esm_model" not in i or ("output_heads" in i and "lora" in i):
+                    print(i)
+                    l1.append(j)
+            optimizer = torch.optim.Adam(
+                l1,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+            for need in self.load_freeze:
+                params = []
+                for i, j in self.named_parameters():
+                    flag = 1
+                    for k in need:
+                        if k not in i:
+                            flag = 0
+                            break
+                    if flag == 1:
+                        print(i)
+                        params.append(j)
+                optimizer.add_param_group({"params": params, "lr": self.lr})
+
         return optimizer
 
 

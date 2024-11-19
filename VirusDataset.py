@@ -6,10 +6,11 @@ import numpy as np
 import pytorch_lightning as L
 import torch
 from esm.utils.constants import esm3 as C
+from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import SubsetRandomSampler
 
-seq_vocab = [
+SEQ_VOCAB = [
     "A",
     "C",
     "D",
@@ -100,7 +101,7 @@ class DataAugmentation:
             self.augs["mutatep"] = mutatep
 
         if vocab is None:
-            self.vocab = seq_vocab
+            self.vocab = SEQ_VOCAB
         else:
             self.vocab = vocab
 
@@ -164,10 +165,85 @@ class DataAugmentation:
         return ret, rettrack
 
 
+class BaseDataset2(Dataset):
+    def __init__(
+        self,
+        data,
+        required_labels=[],
+        seq=["NSP5", "E", "S"],
+        return_mask=True,
+        mask=[0.25, 0.5, 1.0],
+        maskp=0.1,
+    ):
+        self.data = data
+        self.required_labels = required_labels
+        self.seq = seq
+        self.return_mask = return_mask
+        self.mask = mask
+        self.maskp = maskp
+
+    def __len__(self):
+        return len(self.data)
+
+    def generateMask(self, ret):
+        mask = {}
+        # print(ret)
+        for i in ret:
+            mask[i] = np.ones_like(ret[i])
+        return mask
+
+    def maskSequence(self, ret, mask):
+        t = random.random()
+        if t < self.mask[0]:
+            return
+        if t < self.mask[1]:
+            for i in self.seq:
+                t = ret[i]
+                num = np.random.binomial(len(t), self.maskp)
+                if num > 0:
+                    a = np.array(random.sample(range(len(t)), num))
+                    t[a] = 0
+                    # print(mask)
+                    mask[i][a] = MASKED_TOKEN
+            return
+        t = random.sample(self.seq, 1)[0]
+        ret[t] = np.zeros_like(ret[t])
+        mask[t] = np.zeros_like(mask[t])
+
+    def __getitem__(self, index):
+        t = self.data[index]
+        ret = {}
+        for i in self.seq:
+            ret[i] = t[i].copy()
+
+        if self.return_mask:
+            mask = self.generateMask(ret)
+            self.maskSequence(ret, mask)
+        else:
+            mask = None
+
+        for i in self.seq:
+            ret["ori_" + i] = t[i].copy()
+
+        labels = []
+        for i in self.required_labels:
+            labels.append(t[i])
+
+        if len(labels) == 0:
+            labels = np.array([])
+
+        return ret, mask, labels
+
+
+IGNORE_TOKEN = 3
+MASKED_TOKEN = 0
+UNMASKED_TOKEN = 1
+
+
 class BaseDataset(Dataset):
     def __init__(
         self,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        tracks=["seq_t"],
         return_mask=False,
         aug: DataAugmentation = None,
         required_labels=[],
@@ -179,12 +255,6 @@ class BaseDataset(Dataset):
         self.aug = aug
         self.ifaug = False
         self.required_labels = required_labels
-
-    def step(self):
-        self.step_cnt += 1
-
-    def resetCnt(self):
-        self.step_cnt = 0
 
     @abc.abstractmethod
     def getToken(self, track, token):
@@ -257,7 +327,8 @@ class BaseDataset(Dataset):
             retsample["ori_" + i] = retsample[i].copy()
 
         if self.return_mask:
-            mask = np.ones_like(retsample[self.tracks[0]], dtype=np.float32)
+            mask = self.generateMask(retsample)
+            # mask = np.ones_like(retsample[self.tracks[0]], dtype=np.float32)
 
         if aug_parameters["maskp"] > 0:
             num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
@@ -265,15 +336,15 @@ class BaseDataset(Dataset):
             if len(pos) > 0:
                 retsample = self._maskSequence(retsample, pos)
             if self.return_mask:
-                mask[pos] = 0
+                mask[pos] &= 2
 
         if aug_parameters["maskpc"] > 0:
             num = np.random.binomial(samplelen - 2, aug_parameters["maskpc"])
             pos = self._generateMaskingPos(num, samplelen, "block")
             if len(pos) > 0:
                 retsample = self._maskSequence(retsample, pos)
-            if self.return_mask:
-                mask[pos] = 0
+                if self.return_mask:
+                    mask[pos] &= 2
 
         if tracks is not None:
             for i in tracks:
@@ -286,6 +357,12 @@ class BaseDataset(Dataset):
             ret["mask"] = mask
 
         return ret
+
+    def generateMask(self, x):
+        for i in x:
+            if i.endswith("_t"):
+                return np.ones_like(x[i], dtype=np.int32)
+        raise ValueError
 
     def processSample(self, sample):
         if self.aug is not None and self.ifaug:
@@ -305,7 +382,7 @@ class BaseDataset(Dataset):
             ret["sample"] = x1
 
             if self.return_mask:
-                ret["mask"] = np.ones_like(x1[self.tracks[0]], dtype=np.float32)
+                ret["mask"] = self.generateMask(x1)
 
         return ret
 
@@ -319,20 +396,161 @@ class BaseDataset(Dataset):
         return labels
 
 
-class ESM3BaseDataset(BaseDataset):
+class BalancedDataset(BaseDataset):
     def __init__(
         self,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        data,
+        tracks=["seq_t"],
         return_mask=False,
         aug: DataAugmentation = None,
+        sample_list=None,
         required_labels=[],
+        shuffle=False,
+        update_pnt=True,
     ) -> None:
         super().__init__(
+            tracks,
+            return_mask,
+            aug,
+            required_labels,
+        )
+        self.data = data
+        self.sample_list = sample_list
+        self.shuffle = shuffle
+        self.update_pnt = update_pnt
+
+        if sample_list is not None:
+            self.sample_list = sample_list
+            self._sample = True
+            for i in range(len(self.sample_list)):
+                if len(self.data[i]) < self.sample_list[i] or self.sample_list[i] < 0:
+                    self.sample_list[i] = len(self.data[i])
+        else:
+            self.sample_list = []
+            self._sample = False
+            for i in self.data:
+                self.sample_list.append(len(i))
+
+        self.data_order = []
+        for i in data:
+            self.data_order.append(np.arange(len(i)))
+
+        self.pnts = [0 for _ in data]
+
+    @property
+    def sample(self):
+        return self._sample
+
+    @sample.setter
+    def sample(self, v: bool):
+        assert isinstance(v, bool)
+
+        self._sample = v
+
+    def __len__(self):
+        if self._sample:
+            t = 0
+            for i in self.sample_list:
+                t += i
+            return t
+        else:
+            t = 0
+            for i in self.data:
+                t += len(i)
+                return t
+
+    def shuffleIndex(self):
+        for i in self.data_order:
+            random.shuffle(i)
+
+    def newEpoch(self):
+        # print("called new epoch")
+        if self.shuffle:
+            self.shuffleIndex()
+        if self.update_pnt:
+            for i in range(len(self.sample_list)):
+                self.pnts[i] += self.sample_list[i]
+                while self.pnts[i] >= len(self.data_order[i]):
+                    self.pnts[i] -= len(self.data_order[i])
+
+    def step(self):
+        self.step_cnt += 1
+
+    def resetCnt(self):
+        self.step_cnt = 0
+
+    def _getitemx1(self, idx):
+        if self.sample:
+            for i in range(len(self.sample_list)):
+                if idx - self.sample_list[i] < 0:
+                    return self.data[i][
+                        self.data_order[i][idx % len(self.data_order[i])]
+                    ]
+
+                else:
+                    idx -= self.sample_list[i]
+        else:
+            for i in self.data:
+                if idx - len(i) < 0:
+                    return i[idx], 1
+                else:
+                    idx -= len(i)
+        raise KeyError
+
+    def __getitem__(self, idx):
+        x1 = {}
+        t1 = self._getitemx1(idx)
+
+        x1 = self.processSample(t1)
+        if "mutated" in x1["parameters"]:
+            label = x1["parameters"]["mutated"]
+        else:
+            label = 0.0
+        labels = self.prepareLabels(t1, label)
+
+        s = x1["sample"]
+        # s["prot"] = x1["prot"]
+        s["mask"] = x1["mask"]
+
+        return s, labels
+
+
+class ESM3MultiTrackAutoEncoderDataset(BalancedDataset):
+    def __init__(
+        self,
+        data,
+        augment: DataAugmentation = None,
+        sample_list=None,
+        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
+        return_mask=True,
+        required_labels=[],
+        shuffle=False,
+        update_pnt=True,
+        ignore_token=["X", "<unk>", "<pad>", "|", "."],
+    ) -> None:
+        super().__init__(
+            data=data,
             tracks=tracks,
             return_mask=return_mask,
-            aug=aug,
+            aug=augment,
+            sample_list=sample_list,
             required_labels=required_labels,
+            shuffle=shuffle,
+            update_pnt=update_pnt,
         )
+        self.ignore_token = []
+        for i in ignore_token:
+            self.ignore_token.append(C.SEQUENCE_VOCAB.index(i))
+
+    def generateMask(self, x):
+
+        ret = super().generateMask(x)
+        if "seq_t" in x:
+            q = x["seq_t"]
+            for i in range(len(q)):
+                if q[i] in self.ignore_token:
+                    ret[i] = IGNORE_TOKEN
+        return ret
 
     def getToken(self, track, token):
         # assert token in ["start", "end", "mask"]
@@ -391,139 +609,7 @@ class ESM3BaseDataset(BaseDataset):
                 return C.SEQUENCE_VOCAB.index(token)
 
 
-class ESM3MultiTrackAutoEncoderDataset(ESM3BaseDataset):
-
-    def __init__(
-        self,
-        data1,
-        augment: DataAugmentation = None,
-        sample_list=None,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
-        return_mask=True,
-        required_labels=[],
-        shuffle=False,
-        update_pnt=True,
-    ) -> None:
-        """_summary_
-
-        Args:
-            data1 (_type_): _description_
-            augment (DataAugmentation, optional): _description_. Defaults to None.
-            pos_neg_sample (_type_, optional): _description_. Defaults to None.
-            tracks (list, optional): _description_. Defaults to ["seq_t", "structure_t", "sasa_t", "second_t"].
-            return_mask (bool, optional): _description_. Defaults to True.
-        """
-        super().__init__(
-            tracks=tracks,
-            return_mask=return_mask,
-            aug=augment,
-            required_labels=required_labels,
-        )
-        self.shuffle = shuffle
-        self.update_pnt = update_pnt
-        self.data1 = data1
-        self.iters = 0
-        self.data1order = []
-        for i in data1:
-            self.data1order.append(np.arange(len(i)))
-
-        self.ifaug = True
-
-        if sample_list is not None:
-            self.sample_list = sample_list
-            for i in range(len(self.sample_list)):
-                if len(self.data1[i]) < self.sample_list[i] or self.sample_list[i] < 0:
-                    self.sample_list[i] = len(self.data1[i])
-        else:
-            self.sample_list = []
-            for i in self.data1:
-                self.sample_list.append(len(i))
-
-        self._sample = True
-
-        self.pnts1 = [0 for i in data1]
-
-        # self.tracks = tracks
-
-    @property
-    def sample(self):
-        return self._sample
-
-    @sample.setter
-    def sample(self, v: bool):
-        assert isinstance(v, bool)
-        self._sample = v
-
-    def __len__(self):
-        if self._sample:
-            t = 0
-            for i in self.sample_list:
-                t += i
-            return t
-        else:
-            t = 0
-            for i in self.data1:
-                t += len(i)
-                return t
-
-    def shuffleIndex(self):
-        for i in self.data1order:
-            random.shuffle(i)
-
-    def newEpoch(self):
-        print("called new epoch")
-        if self.shuffle:
-            self.shuffleIndex()
-        if self.update_pnt:
-            for i in range(len(self.sample_list)):
-                self.pnts1[i] += self.sample_list[i]
-                while self.pnts1[i] >= len(self.data1order[i]):
-                    self.pnts1[i] -= len(self.data1order[i])
-
-    def getOrigin(self):
-        ret = []
-        for i in range(len(self)):
-            t, _ = self._getitemx1(i)
-            ret.append(t["origin"])
-        return ret
-
-    def _getitemx1(self, idx):
-        if self.sample:
-            for i in range(len(self.sample_list)):
-                if idx - self.sample_list[i] < 0:
-                    return self.data1[i][
-                        self.data1order[i][idx % len(self.data1order[i])]
-                    ]
-
-                else:
-                    idx -= self.sample_list[i]
-        else:
-            for i in self.data1:
-                if idx - len(i) < 0:
-                    return i[idx], 1
-                else:
-                    idx -= len(i)
-        raise KeyError
-
-    def __getitem__(self, idx):
-        x1 = {}
-        t1 = self._getitemx1(idx)
-
-        x1 = self.processSample(t1)
-        if "mutated" in x1["parameters"]:
-            label = x1["parameters"]["mutated"]
-        else:
-            label = 0.0
-        labels = self.prepareLabels(t1, label)
-
-        s = x1["sample"]
-        # s["prot"] = x1["prot"]
-        s["mask"] = x1["mask"]
-
-        return s, labels
-
-
-class ESM3MultiTrackDataset(ESM3BaseDataset):
+class ESM3MultiTrackDataset(BaseDataset):
 
     def __init__(
         self,
@@ -647,111 +733,62 @@ class ESM3BalancedDataModule(L.LightningDataModule):
         )
 
 
-class ESM3datamoduleSingle(L.LightningDataModule):
+class Stage2DataModule(L.LightningDataModule):
     def __init__(
         self,
-        ds1: ESM3BaseDataset,
+        data,
         batch_size=1,
-        train_test_split=[0.85, 0.15],
+        validate_size=1000,
         seed=1509,
+        seq=["NSP5", "E", "S"],
+        required_labels=[],
+        mask=[0.25, 0.5, 1.0],
+        maskp=0.1,
     ):
         super().__init__()
-        self.value = 0
-        # self.ds1 = ds1
-        # self.ds2 = ds2
+        # print(len(data))
         self.batch_size = batch_size
         self.seed = seed
-        L.seed_everything(self.seed)
 
-        train_set, val_set = torch.utils.data.random_split(ds1, train_test_split)
-        all_indices = np.arange(len(ds1))
+        from sklearn.model_selection import train_test_split
 
-        self.trainval_set = ds1
-        self.train_indices = all_indices[: int(len(all_indices) * train_test_split[0])]
-        self.val_indices = all_indices[int(len(all_indices) * train_test_split[0]) :]
+        # self.traindata = []
+        # self.train_indices = []
+        # self.valdata = []
+        # self.val_indices = []
+        # L.seed_everything(self.seed)
+
+        self.traindata, self.valdata, self.train_indices, self.val_indices = (
+            train_test_split(
+                data,
+                range(len(data)),
+                test_size=validate_size,
+                random_state=self.seed,
+            )
+        )
+
+        self.train_set = BaseDataset2(
+            self.traindata,
+            required_labels=required_labels,
+            seq=seq,
+            mask=mask,
+            maskp=maskp,
+        )
+
+        self.val_set = BaseDataset2(
+            self.valdata,
+            required_labels=required_labels,
+            seq=seq,
+            mask=mask,
+            maskp=maskp,
+        )
 
     def train_dataloader(self):
-        self.value += 1
-        self.trainval_set.resetCnt()
-        print("get train loader")
-        return MyDataLoader(
-            self.trainval_set,
-            True,
-            batch_size=self.batch_size,
-            sampler=SubsetRandomSampler(self.train_indices),
-            num_workers=4,
+        return DataLoader(
+            self.train_set, batch_size=self.batch_size, num_workers=4, shuffle=True
         )
 
     def val_dataloader(self):
-        self.value += 1
-        print("get val loader")
-        return MyDataLoader(
-            self.trainval_set,
-            False,
-            batch_size=self.batch_size,
-            sampler=SubsetRandomSampler(self.val_indices),
-            num_workers=4,
-        )
-
-    def predict_dataloader(self):
-        self.value += 1
-        print("get predict loader")
-        return MyDataLoader(
-            self.testset, False, batch_size=self.batch_size, shuffle=True, num_workers=4
-        )
-
-
-class ESM3datamodule(L.LightningDataModule):
-    def __init__(
-        self,
-        ds1: ESM3BaseDataset,
-        ds2: ESM3BaseDataset,
-        batch_size=1,
-        train_test_split=[0.85, 0.15],
-        seed=1509,
-    ):
-        super().__init__()
-        self.value = 0
-        # self.ds1 = ds1
-        # self.ds2 = ds2
-        self.batch_size = batch_size
-        self.seed = seed
-        torch.manual_seed(self.seed)
-
-        train_set, val_set = torch.utils.data.random_split(ds1, train_test_split)
-        all_indices = np.arange(len(ds1))
-
-        self.trainval_set = ds1
-        self.train_indices = all_indices[: int(len(all_indices) * train_test_split[0])]
-        self.val_indices = all_indices[int(len(all_indices) * train_test_split[0]) :]
-        self.testset = ds2
-
-    def train_dataloader(self):
-        self.value += 1
-        self.trainval_set.resetCnt()
-        print("get train loader")
-        return MyDataLoader(
-            self.trainval_set,
-            True,
-            batch_size=self.batch_size,
-            sampler=SubsetRandomSampler(self.train_indices),
-            num_workers=4,
-        )
-
-    def val_dataloader(self):
-        self.value += 1
-        print("get val loader")
-        return MyDataLoader(
-            self.trainval_set,
-            False,
-            batch_size=self.batch_size,
-            sampler=SubsetRandomSampler(self.val_indices),
-            num_workers=4,
-        )
-
-    def predict_dataloader(self):
-        self.value += 1
-        print("get predict loader")
-        return MyDataLoader(
-            self.testset, False, batch_size=self.batch_size, shuffle=True, num_workers=4
+        return DataLoader(
+            self.val_set, batch_size=self.batch_size, num_workers=4, shuffle=False
         )
