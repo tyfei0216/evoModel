@@ -71,7 +71,7 @@ class DecoderBlock(nn.Module):
         self.clf = nn.Linear(channels, classes)
 
     def forward(self, x):
-        for block in self.encoder_blocks:
+        for block in self.transformer_blocks:
             x = block(x)
         x = self.clf(x)
         return x
@@ -156,6 +156,8 @@ class CrossGeneModel(L.LightningModule):
         only_embed=False,
         label_weights=None,
         l=1.0,
+        classes=33,
+        ori_seqs={},
     ):
         super().__init__()
 
@@ -179,6 +181,13 @@ class CrossGeneModel(L.LightningModule):
             self.cri2 = nn.BCEWithLogitsLoss()
         self.clf = Linearcls(**clf_params)
         self.only_embed = only_embed
+
+        self.ori_seqs = {}
+        for i in ori_seqs:
+            t = torch.tensor(ori_seqs[i], requires_grad=False)
+            self.ori_seqs[i] = t
+            self.register_buffer("ori_seq_" + i, t)
+        self.embed = nn.Embedding(classes, in_channels)
 
         self.training_step_outputs = []
         self.validation_step_outputs = []
@@ -400,13 +409,16 @@ class AutoEncoder(L.LightningModule):
         l=1.0,
         tf=0.5,
         ori_seqs={},
+        transformer_layers=3,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["esm_model"])
         self.esm_model = esm_model
         self.bottleneck = nn.Linear(in_channels, out_channels)
 
-        self.decoder = DecoderBlock(out_channels, n_head, classes)
+        self.decoder = DecoderBlock(
+            out_channels, n_head, classes, transformer_layers=transformer_layers
+        )
         self.clf = Linearcls(**clf_params)
 
         self.in_channels = in_channels

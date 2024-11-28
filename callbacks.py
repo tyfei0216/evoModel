@@ -27,7 +27,7 @@ class LambdaUpdate(L.Callback):
         else:
             self.cnt += 1
 
-        if self.cnt == self.check:
+        if self.cnt >= self.check:
             self.cnt = 0
             self.lp += 1
             self.lp = min(len(self.l) - 1, self.lp)

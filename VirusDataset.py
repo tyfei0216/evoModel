@@ -331,15 +331,23 @@ class BaseDataset(Dataset):
             # mask = np.ones_like(retsample[self.tracks[0]], dtype=np.float32)
 
         if aug_parameters["maskp"] > 0:
-            num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
+            while True:
+                num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
+                if samplelen > num + 5:
+                    break
+            # num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
             pos = self._generateMaskingPos(num, samplelen)
             if len(pos) > 0:
                 retsample = self._maskSequence(retsample, pos)
-            if self.return_mask:
-                mask[pos] &= 2
+                if self.return_mask:
+                    mask[pos] &= 2
 
         if aug_parameters["maskpc"] > 0:
-            num = np.random.binomial(samplelen - 2, aug_parameters["maskpc"])
+            while True:
+                num = np.random.binomial(samplelen - 2, aug_parameters["maskpc"])
+                if samplelen > num + 5:
+                    break
+
             pos = self._generateMaskingPos(num, samplelen, "block")
             if len(pos) > 0:
                 retsample = self._maskSequence(retsample, pos)
@@ -713,6 +721,7 @@ class ESM3BalancedDataModule(L.LightningDataModule):
     def train_dataloader(self):
         self.value += 1
         print("get train loader")
+        # return DataLoader(self.train_set, batch_size=self.batch_size, num_workers=4)
         return MyDataLoader(
             self.train_set,
             True,

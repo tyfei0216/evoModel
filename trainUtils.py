@@ -209,6 +209,7 @@ def buildAutoEncoder(configs, model):
         clf_params=configs["model"]["clf_params"],
         masked_weight=configs["model"]["masked_weight"],
         label_weights=configs["model"]["label_weights"],
+        transformer_layers=configs["model"]["transformer_layers"],
         ori_seqs=ori_seqs,
         l=configs["model"]["l"][0],
         tf=configs["model"]["teaching force"][0],
@@ -290,6 +291,9 @@ def buildTrainer(configs, args):
         args.strategy = pytorch_lightning.strategies.DeepSpeedStrategy()
 
     pytorch_lightning.seed_everything(configs["train"]["seed"])
+
+    if "val_check_interval" not in configs["train"]:
+        configs["train"]["val_check_interval"] = None
 
     trainer = pytorch_lightning.Trainer(
         strategy=args.strategy,
