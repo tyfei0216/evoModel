@@ -149,7 +149,7 @@ def getCallbacks(configs, args) -> List[L.Callback]:
         save_top_k=k,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training
         dirpath=args.path,  # Directory where the checkpoints will be saved
-        filename="{epoch}-{epoch_validate_loss:.2f}",  # Checkpoint file naming pattern
+        filename="{epoch}-{epoch_validate_loss:.4f}",  # Checkpoint file naming pattern
     )
     ret.append(checkpoint_callback)
 
