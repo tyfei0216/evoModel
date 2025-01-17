@@ -72,7 +72,6 @@ class DataAugmentation:
         mutate: list = None,
         mutatep: list = None,
         vocab: list = None,
-        tracks: dict = {"seq_t": 1, "structure_t": 1, "sasa_t": 1, "second_t": 1},
     ) -> None:
         self.augs = {}
         if maskp is not None:
@@ -105,9 +104,6 @@ class DataAugmentation:
         else:
             self.vocab = vocab
 
-        self.tracks = tracks
-        # if self.tracks == None:
-        #     self.tracks = {"seq_t": 1, "structure_t": 1, "sasa_t": 1, "second_t": 1}
         self.step_points = step_points
 
         self.croprange = croprange
@@ -126,19 +122,6 @@ class DataAugmentation:
 
     def getAugmentationParameters(self, seqlen, step):
         ret = self._getSettings(step)
-        rettrack = {}
-        flag = 0
-        for i in self.tracks:
-
-            r = np.random.uniform(0.001, 0.999)
-            if r < self.tracks[i]:
-                flag = 1
-                rettrack[i] = True
-            else:
-                rettrack[i] = False
-
-        if flag == 0:
-            rettrack["seq_t"] = True
         if "mutate" in ret and ret["mutate"] > 0:
             t = random.random()
             if t < ret["mutate"]:
@@ -159,12 +142,13 @@ class DataAugmentation:
                     sampledlen = MIN_LENGTH if sampledlen < MIN_LENGTH else sampledlen
                     sampledlen = min(sampledlen, seqlen - 2)
                     ret["crop"] = sampledlen
-                return ret, rettrack
+                return ret
 
         ret["crop"] = -1
-        return ret, rettrack
+        return ret
 
 
+# deprecated
 class BaseDataset2(Dataset):
     def __init__(
         self,
@@ -235,7 +219,7 @@ class BaseDataset2(Dataset):
         return ret, mask, labels
 
 
-IGNORE_TOKEN = 3
+IGNORE_TOKEN = 2
 MASKED_TOKEN = 0
 UNMASKED_TOKEN = 1
 
@@ -243,34 +227,42 @@ UNMASKED_TOKEN = 1
 class BaseDataset(Dataset):
     def __init__(
         self,
-        tracks=["seq_t"],
-        return_mask=False,
+        seq: list[str],
         aug: DataAugmentation = None,
         required_labels=[],
     ) -> None:
-        assert len(tracks) > 0
-        self.tracks = tracks
         self.step_cnt = 0
-        self.return_mask = return_mask
         self.aug = aug
-        self.ifaug = False
         self.required_labels = required_labels
+        assert len(seq) > 0
+        self.seq = seq
 
     @abc.abstractmethod
-    def getToken(self, track, token):
+    def getToken(self, token):
         pass
 
-    def _maskSequence(self, sample, pos):
-        for i in sample:
-            if not i.startswith("ori"):
-                sample[i][pos] = self.getToken(i, "mask")
+    def _maskSequence(self, sample, mask, p, method="point", avoid=None):
+        while True:
+            num = np.random.binomial(len(sample) - 2, p)
+            if len(sample) > num + 5:
+                break
+        pos = self._generateMaskingPos(num, len(sample), method, avoid)
+        if len(pos) > 0:
+            sample[pos] = self.getToken("mask")
+            mask[pos] &= 2
 
-        return sample
+        return sample, mask
 
-    def _generateMaskingPos(self, num, length, method="point"):
+    def _generateMaskingPos(self, num, length, method="point", exclude=None):
         assert length > num + 5
         if method == "point":
-            a = np.array(random.sample(range(length - 2), num)) + 1
+            t = list(range(1, length - 1))
+            if exclude is not None:
+                t = list(set(t) - set(exclude))
+            num = min(num, len(t) - 10)
+            if num <= 0:
+                return []
+            a = np.array(random.sample(t, num))
             return a
         elif method == "block":
             s = random.randint(1, length - num)
@@ -279,123 +271,81 @@ class BaseDataset(Dataset):
         else:
             raise NotImplementedError
 
-    def _cropSequence(self, sample, start, end):
-        for i in sample:
-            t = torch.zeros((end - start + 2), dtype=torch.long)
-            t[1:-1] = torch.tensor(sample[i][start:end])
-            t[0] = self.getToken(i, "start")
-            t[-1] = self.getToken(i, "end")
-            sample[i] = t
-        return sample
+    def _cropSequence(self, sample, crop_length):
+        if len(sample) < crop_length + 2 or crop_length < MIN_LENGTH:
+            return sample
+        s = random.randint(1, len(sample) - crop_length - 1)
+        start = s
+        end = s + crop_length
+        t = torch.zeros((end - start + 2), dtype=torch.long)
+        t[1:-1] = torch.tensor(sample[start:end])
+        t[0] = self.getToken("start")
+        t[-1] = self.getToken("end")
+        return t
 
-    def _mutateSample(self, sample, pos):
+    def _mutateSample(self, sample, p, avoid):
+        num = np.random.binomial(len(sample) - 2, p)
+        pos = self._generateMaskingPos(num, len(sample), exclude=avoid)
         for i in pos:
-            sample["seq_t"][i] = self.getToken(
-                "seq_t", random.sample(self.aug.vocab, 1)[0]
-            )
+            sample[i] = self.getToken("seq_t", random.sample(self.aug.vocab, 1)[0])
 
-        return sample
+        return sample, pos
 
-    def _augmentSample(self, sample, aug_parameters, tracks=None):
+    @abc.abstractmethod
+    def _generateMask(self, sample):
+        pass
+
+    def _augmentSample(self, sample, aug_parameters):
         ret = {}
         ret["parameters"] = aug_parameters
-        ret["prot"] = sample["prot"]
 
-        if tracks is None:
-            tracks = self.tracks
+        sample = sample.copy()
 
-        retsample = {}
-        for i in tracks:
-            retsample[i] = sample[i].copy()
+        sample = self._cropSequence(sample, aug_parameters["crop"])
 
-        samplelen = len(sample[self.tracks[0]])
+        mask, avoid = self._generateMask(sample)
 
-        if aug_parameters["crop"] > MIN_LENGTH:
-            s = random.randint(1, samplelen - aug_parameters["crop"] - 1)
-            retsample = self._cropSequence(retsample, s, s + aug_parameters["crop"])
-            samplelen = aug_parameters["crop"] + 2
+        sample, pos = self._mutateSample(sample, aug_parameters["mutatep"], avoid)
 
-        ret["parameters"]["mutated"] = 0.0
-        if "seq_t" in tracks and aug_parameters["mutate"] > 0.5:
-            num = np.random.binomial(samplelen - 2, aug_parameters["mutatep"])
-            pos = self._generateMaskingPos(num, samplelen)
-            if len(pos) > 0:
-                retsample = self._mutateSample(retsample, pos)
-                ret["parameters"]["mutated"] = 1.0
+        ret["mutate_pos"] = pos
 
-        for i in tracks:
-            retsample["ori_" + i] = retsample[i].copy()
+        avoid = np.concatenate([avoid, pos])
 
-        if self.return_mask:
-            mask = self.generateMask(retsample)
-            # mask = np.ones_like(retsample[self.tracks[0]], dtype=np.float32)
+        ret["ori_seq"] = sample.copy()
 
         if aug_parameters["maskp"] > 0:
-            while True:
-                num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
-                if samplelen > num + 5:
-                    break
-            # num = np.random.binomial(samplelen - 2, aug_parameters["maskp"])
-            pos = self._generateMaskingPos(num, samplelen)
-            if len(pos) > 0:
-                retsample = self._maskSequence(retsample, pos)
-                if self.return_mask:
-                    mask[pos] &= 2
+            sample, mask = self._maskSequence(
+                sample, mask, aug_parameters["maskp"], avoid
+            )
 
         if aug_parameters["maskpc"] > 0:
-            while True:
-                num = np.random.binomial(samplelen - 2, aug_parameters["maskpc"])
-                if samplelen > num + 5:
-                    break
+            sample, mask = self._maskSequence(
+                sample, mask, aug_parameters["maskpc"], method="block"
+            )
 
-            pos = self._generateMaskingPos(num, samplelen, "block")
-            if len(pos) > 0:
-                retsample = self._maskSequence(retsample, pos)
-                if self.return_mask:
-                    mask[pos] &= 2
-
-        if tracks is not None:
-            for i in tracks:
-                if not tracks[i]:
-                    sample.pop(i)
-
-        retsample["prot"] = sample["prot"]
-        ret["sample"] = retsample
-        if self.return_mask:
-            ret["mask"] = mask
+        ret["mask"] = mask
+        ret["sample"] = sample
 
         return ret
 
-    def generateMask(self, x):
-        for i in x:
-            if i.endswith("_t"):
-                return np.ones_like(x[i], dtype=np.int32)
-        raise ValueError
-
-    def processSample(self, sample):
+    def processSeq(self, sample):
         if self.aug is not None and self.ifaug:
-            aug_parameters, tracks = self.aug.getAugmentationParameters(
-                len(sample[self.tracks[0]]), self.step_cnt
+            aug_parameters = self.aug.getAugmentationParameters(
+                len(sample), self.step_cnt
             )
-            ret = self._augmentSample(sample, aug_parameters, tracks)
+            ret = self._augmentSample(sample, aug_parameters)
         else:
             ret = {}
-            x1 = {}
-            for i in self.tracks:
-                x1[i] = sample[i]
-                x1["ori_" + i] = sample[i]
-
-            x1["prot"] = sample["prot"]
             ret["parameters"] = {}
-            ret["sample"] = x1
-
-            if self.return_mask:
-                ret["mask"] = self.generateMask(x1)
-
+            ret["sample"] = sample.copy()
+            ret["ori_seq"] = sample.copy()
+            ret["mutate_pos"] = []
+            ret["mask"], _ = self._generateMask(sample)
         return ret
 
-    def prepareLabels(self, sample, label):
-        labels = [label]
+    def prepareLabels(self, sample, labels):
+        if not isinstance(labels, list):
+            labels = [labels]
         for i in self.required_labels:
             if "classes" in sample and i in sample["sample"]["classes"]:
                 labels.append(sample["classes"][i])
@@ -404,6 +354,366 @@ class BaseDataset(Dataset):
         return labels
 
 
+class VESMDataset(BaseDataset):
+    def __init__(
+        self,
+        data,
+        stage,
+        seq: list[str],
+        aug: DataAugmentation = None,
+        sample_list=None,
+        required_labels=[],
+        shuffle=False,
+        update_pnt=True,
+        stage_2_maskp=0.2,
+        train_time_series=True,
+        ignore_token=["X", "<unk>", "<pad>", "|", "."],
+    ) -> None:
+        super().__init__(
+            seq,
+            aug,
+            required_labels,
+        )
+        assert stage in [
+            "training stage 1",
+            "training stage 2",
+            "training stage 1 + stage 2",
+            "inference",
+        ]
+
+        if "stage 1" not in stage:
+            self.ifaug = False
+        else:
+            self.ifaug = True
+
+        self.train_time_series = train_time_series
+        self.stage = stage
+        self.data = data
+        self.sample_list = sample_list
+        self.shuffle = shuffle
+        self.update_pnt = update_pnt
+
+        if sample_list is not None:
+            self.sample_list = sample_list
+            self._sample = True
+            for i in range(len(self.sample_list)):
+                if len(self.data[i]) < self.sample_list[i] or self.sample_list[i] < 0:
+                    self.sample_list[i] = len(self.data[i])
+        else:
+            self.sample_list = []
+            self._sample = False
+            for i in self.data:
+                self.sample_list.append(len(i))
+
+        self.data_order = []
+        for i in data:
+            self.data_order.append(np.arange(len(i)))
+
+        self.pnts = [0 for _ in data]
+
+        self.stage_2_maskp = stage_2_maskp
+
+        self.ignore_token = []
+        for i in ignore_token:
+            self.ignore_token.append(C.SEQUENCE_VOCAB.index(i))
+
+    def _generateMask(self, seq):
+
+        mask = np.ones_like(seq, dtype=np.int32)
+        pos = np.where(np.isin(seq, self.ignore_token))[0]
+        mask[pos] = IGNORE_TOKEN
+        return mask, pos
+
+    def getToken(self, track, token):
+        # assert token in ["start", "end", "mask"]
+        match token:
+            case "start":
+                match track:
+                    case "seq_t":
+                        return C.SEQUENCE_BOS_TOKEN
+                    case "structure_t":
+                        return C.STRUCTURE_BOS_TOKEN
+                    case "sasa_t":
+                        return 0
+                    case "second_t":
+                        return 0
+                    case _:
+                        raise ValueError
+            case "end":
+                match track:
+                    case "seq_t":
+                        return C.SEQUENCE_EOS_TOKEN
+                    case "structure_t":
+                        return C.STRUCTURE_EOS_TOKEN
+                    case "sasa_t":
+                        return 0
+                    case "second_t":
+                        return 0
+                    case _:
+                        raise ValueError
+            case "mask":
+                match track:
+                    case "seq_t":
+                        return C.SEQUENCE_MASK_TOKEN
+                    case "structure_t":
+                        return C.STRUCTURE_MASK_TOKEN
+                    case "sasa_t":
+                        return C.SASA_UNK_TOKEN
+                    case "second_t":
+                        return C.SS8_UNK_TOKEN
+                    case _:
+                        raise ValueError("mask of %s is not found" % track)
+            case "pad":
+                match track:
+                    case "seq_t":
+                        return C.SEQUENCE_PAD_TOKEN
+                    case "structure_t":
+                        return C.STRUCTURE_PAD_TOKEN
+                    case "sasa_t":
+                        return C.SASA_PAD_TOKEN
+                    case "second_t":
+                        return C.SS8_PAD_TOKEN
+                    case _:
+                        raise ValueError
+            case _:
+                assert track == "seq_t"
+                assert token in C.SEQUENCE_VOCAB
+                return C.SEQUENCE_VOCAB.index(token)
+
+    def __len__(self):
+        if self._sample:
+            t = 0
+            for i in self.sample_list:
+                t += i
+            return t
+        else:
+            t = 0
+            for i in self.data:
+                t += len(i)
+                return t
+
+    def shuffleIndex(self):
+        for i in self.data_order:
+            random.shuffle(i)
+
+    def newEpoch(self):
+        if self.shuffle:
+            self.shuffleIndex()
+        if self.update_pnt:
+            for i in range(len(self.sample_list)):
+                self.pnts[i] += self.sample_list[i]
+                while self.pnts[i] >= len(self.data_order[i]):
+                    self.pnts[i] -= len(self.data_order[i])
+
+    def step(self):
+        self.step_cnt += 1
+
+    def getSample(self, data, input_idx):
+        sample = {}
+        sample["input"] = {}
+        sample["meta"] = {}
+        if "stage 2" in self.stage:
+            for i in self.seq:
+                sample["input"][i] = data[i]
+        else:
+            q = self.seq[input_idx % len(self.seq)]
+            sample["input"][q] = data[q]
+        for i in ["id", "bin", "days"]:
+            sample["meta"][i] = data[i]
+        return sample
+
+    def _getitemx1(self, idx):
+        ori_idx = idx
+        if self._sample:
+            for i in range(len(self.sample_list)):
+                if idx - self.sample_list[i] < 0:
+                    # sample = self.getSample(
+                    #     self.data[i],
+                    #     self.data_order[i][idx % len(self.data_order[i])],
+                    #     ori_idx,
+                    # )
+                    sample = self.data[i][
+                        self.data_order[i][idx % len(self.data_order[i])]
+                    ]
+                    sample = self.getSample(sample, ori_idx)
+                    if self.train_time_series:
+                        t = random.choice(range(len(self.data[i])))
+                        # q = self.getSample(self.data[i], t, ori_idx)
+                        q = self.data[i][t]
+                        q = self.getSample(q, ori_idx)
+                        if sample["meta"]["days"] > q["meta"]["days"]:
+                            return q, sample
+                        return sample, q
+
+                    return sample
+
+                else:
+                    idx -= self.sample_list[i]
+        else:
+            for i in self.data:
+                if idx - len(i) < 0:
+                    sample = i[idx]
+                    sample = self.getSample(i, ori_idx)
+                    if self.train_time_series:
+                        t = random.choice(range(len(i)))
+                        q = i[t]
+                        q = self.getSample(i, ori_idx)
+                        if sample["meta"]["days"] > q["meta"]["days"]:
+                            return q, sample
+                        return sample, q
+                    return sample
+                else:
+                    idx -= len(i)
+        raise KeyError
+
+    def processSample(self, t):
+        x1 = {}
+        x1["input"] = {}
+        x1["ori_seq"] = {}
+
+        if "stage 1" in self.stage:
+            x1["stage_1_masks"] = {}
+            x1["label"] = {}
+            for i in t["input"]:
+                seq = t["input"][i]
+                ret = self.processSeq(seq)
+                x1["input"][i] = ret["sample"]
+                x1["ori_seq"][i] = ret["ori_seq"]
+                x1["stage_1_masks"][i] = ret["mask"]
+                # x1["label"][i] = np.array(len(ret["mutate_pos"]) > 0, dtype=int)
+                x1["label"][i] = self.prepareLabels(t, int(len(ret["mutate_pos"]) > 0))
+        else:
+            # x1["stage_1_masks"] = None
+            # x1["label"] = None
+            for i in t["input"]:
+                seq = t["input"][i]
+                x1["input"][i] = seq
+                x1["ori_seq"][i] = seq
+
+        if "stage 2" in self.stage:
+            x1["stage_2_masks"] = []
+            for i in self.seq:
+                r = np.random.uniform(0.001, 0.999)
+                if r < self.stage_2_maskp:
+                    x1["stage_2_masks"].append(i)
+        # else:
+        # x1["stage_2_masks"] = None
+
+        x1["meta"] = t["meta"]
+        return x1
+
+    def __getitem__(self, idx):
+        if self.train_time_series:
+            t1, t2 = self._getitemx1(idx)
+            x1 = self.processSample(t1)
+            x2 = self.processSample(t2)
+            return x1, x2
+        else:
+            t1 = self._getitemx1(idx)
+            x1 = self.processSample(t1)
+            return x1
+
+
+class VESMDataModule(L.LightningDataModule):
+    def __init__(
+        self,
+        data1,
+        seq,
+        stage,
+        batch_size=1,
+        sample_train=None,
+        sample_val=None,
+        train_test_ratio=[0.85, 0.15],
+        aug=None,
+        seed=1509,
+        stage_2_maskp=0.2,
+        required_labels=[],
+        train_time_series=True,
+        ignore_token=["X", "<unk>", "<pad>", "|", "."],
+    ):
+        super().__init__()
+        assert stage in [
+            "training stage 1",
+            "training stage 2",
+            "training stage 1 + stage 2",
+            "inference",
+        ]
+        self.stage = stage
+        self.seq = seq
+        self.value = 0
+        self.batch_size = batch_size
+        self.seed = seed
+
+        from sklearn.model_selection import train_test_split
+
+        self.traindata1 = []
+        self.train_indices1 = []
+        self.valdata1 = []
+        self.val_indices1 = []
+
+        L.seed_everything(self.seed)
+
+        for i in data1:
+            d1, v1, i1, i2 = train_test_split(
+                i,
+                range(len(i)),
+                train_size=train_test_ratio[0],
+                random_state=self.seed,
+            )
+            self.traindata1.append(d1)
+            self.valdata1.append(v1)
+            self.train_indices1.append(i1)
+            self.val_indices1.append(i2)
+
+        self.train_set = VESMDataset(
+            self.traindata1,
+            stage,
+            seq,
+            aug=aug,
+            sample_list=sample_train,
+            stage_2_maskp=stage_2_maskp,
+            required_labels=required_labels,
+            train_time_series=train_time_series,
+            ignore_token=ignore_token,
+        )
+
+        self.val_set = VESMDataset(
+            self.valdata1,
+            stage,
+            seq,
+            aug=aug,
+            sample_list=sample_val,
+            stage_2_maskp=stage_2_maskp,
+            required_labels=required_labels,
+            train_time_series=train_time_series,
+            ignore_token=ignore_token,
+        )
+
+    def train_dataloader(self):
+        self.value += 1
+        print("get train loader")
+        # return DataLoader(self.train_set, batch_size=self.batch_size, num_workers=4)
+        return MyDataLoader(
+            self.train_set,
+            True,
+            shuffle=True,
+            batch_size=self.batch_size,
+            num_workers=4,
+        )
+
+    def val_dataloader(self):
+        self.value += 1
+        print("get val loader")
+        return MyDataLoader(
+            self.val_set,
+            False,
+            shuffle=False,
+            batch_size=self.batch_size,
+            num_workers=4,
+        )
+
+
+# deprecated
 class BalancedDataset(BaseDataset):
     def __init__(
         self,
@@ -500,7 +810,7 @@ class BalancedDataset(BaseDataset):
         else:
             for i in self.data:
                 if idx - len(i) < 0:
-                    return i[idx], 1
+                    return i[idx]
                 else:
                     idx -= len(i)
         raise KeyError
@@ -523,6 +833,7 @@ class BalancedDataset(BaseDataset):
         return s, labels
 
 
+# deprecated
 class ESM3MultiTrackAutoEncoderDataset(BalancedDataset):
     def __init__(
         self,
@@ -617,6 +928,7 @@ class ESM3MultiTrackAutoEncoderDataset(BalancedDataset):
                 return C.SEQUENCE_VOCAB.index(token)
 
 
+# deprecated
 class ESM3MultiTrackDataset(BaseDataset):
 
     def __init__(
@@ -663,6 +975,7 @@ class ESM3MultiTrackDataset(BaseDataset):
         return x1, torch.tensor([self.label[idx]]), x2
 
 
+# deprecated
 class ESM3BalancedDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -742,6 +1055,7 @@ class ESM3BalancedDataModule(L.LightningDataModule):
         )
 
 
+# deprecated
 class Stage2DataModule(L.LightningDataModule):
     def __init__(
         self,

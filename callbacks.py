@@ -142,9 +142,13 @@ def getCallbacks(configs, args) -> List[L.Callback]:
     k = 2
     if "save" in configs["train"]:
         k = configs["train"]["save"]
-
+    monitor = (
+        configs["train"]["monitor"]
+        if "monitor" in configs["train"]
+        else "validation_loss"
+    )
     checkpoint_callback = ModelCheckpoint(
-        monitor="epoch_validate_loss",  # Replace with your validation metric
+        monitor=monitor,  # Replace with your validation metric
         mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
         save_top_k=k,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training

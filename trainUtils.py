@@ -20,9 +20,19 @@ def loadesm3(configs):
     from esm.models.esm3 import ESM3
 
     model = ESM3.from_pretrained("esm3_sm_open_v1").cpu()
-    model = modules.fixParameters(
-        model, unfix=configs["pretrain_model"]["unfix_layers"]
-    )
+
+    unfixes = configs["pretrain_model"]["unfix_layers"]
+    if (
+        "unlock_norm_weights" in configs["pretrain_model"]
+        and configs["pretrain_model"]["unlock_norm_weights"]
+    ):
+        unfixes.append("norm.weight")
+        unfixes.append("layernorm_qkv.0.weight")
+        unfixes.append("layernorm_qkv.0.bias")
+        unfixes.append("q_ln.weight")
+        unfixes.append("k_ln.weight")
+
+    model = modules.fixParameters(model, unfix=unfixes)
     q = [
         "transformer.blocks." + str(s) + "."
         for s in configs["pretrain_model"]["add_lora"]
@@ -33,6 +43,7 @@ def loadesm3(configs):
         ranks=configs["pretrain_model"]["rank"],
         alphas=configs["pretrain_model"]["alpha"],
     )
+    # model = modules.ESMModule(model, "esm3")
     return model
 
 
@@ -40,8 +51,45 @@ def loadNone(config):
     return None
 
 
+def loadesmc(configs):
+    from esm.models.esmc import ESMC
+
+    model = ESMC.from_pretrained(
+        configs["pretrain_model"]["model"], torch.device("cpu")
+    )  # .cpu()
+    q = [
+        "transformer.blocks." + str(s) + "."
+        for s in configs["pretrain_model"]["add_lora"]
+    ]
+    unfixes = configs["pretrain_model"]["unfix_layers"]
+    if (
+        "unlock_norm_weights" in configs["pretrain_model"]
+        and configs["pretrain_model"]["unlock_norm_weights"]
+    ):
+        unfixes.append("norm.weight")
+        unfixes.append("layernorm_qkv.0.weight")
+        unfixes.append("layernorm_qkv.0.bias")
+        unfixes.append("q_ln.weight")
+        unfixes.append("k_ln.weight")
+
+    model = modules.fixParameters(
+        model, unfix=configs["pretrain_model"]["unfix_layers"]
+    )
+    model = modules.addlora(
+        model,
+        layers=q,
+        ranks=configs["pretrain_model"]["rank"],
+        alphas=configs["pretrain_model"]["alpha"],
+        # dtype=torch.bfloat16,
+    )
+    # model = modules.ESMModule(model, "esmc")
+    return model
+
+
 LOAD_PRETRAIN = {
     "esm3": loadesm3,
+    "esmc_600m": loadesmc,
+    "esmc_300m": loadesmc,
     "None": loadNone,
 }
 
@@ -110,8 +158,8 @@ def loadDatasetesm3(configs):
     return ds
 
 
-def loadBalancedDatasetesm3ae(configs):
-
+def loadDataset(configs) -> pytorch_lightning.LightningDataModule:
+    # dataset = "esm2"
     datasets = []
     lens = []
 
@@ -131,108 +179,27 @@ def loadBalancedDatasetesm3ae(configs):
     maskpc = configs["augmentation"]["maskpc"]
     mutate = configs["augmentation"]["mutate"]
     mutatep = configs["augmentation"]["mutatep"]
-    tracks = configs["augmentation"]["tracks"]
 
     aug = VirusDataset.DataAugmentation(
-        step_points, maskp, maskpc, crop, lens, mutate, mutatep, tracks=tracks
+        step_points, maskp, maskpc, crop, lens, mutate, mutatep
     )
 
     if "required_labels" not in configs["dataset"]:
         configs["dataset"]["required_labels"] = []
 
-    ds = VirusDataset.ESM3BalancedDataModule(
+    ds = VirusDataset.VESMDataModule(
         datasets,
-        configs["train"]["batch_size"],
+        seq=configs["dataset"]["seq"],
+        stage=configs["model"]["stage"],
+        batch_size=configs["train"]["batch_size"],
         sample_train=configs["dataset"]["dataset_train_sample"],
         sample_val=configs["dataset"]["dataset_val_sample"],
         train_test_ratio=configs["dataset"]["train_test_ratio"],
         aug=aug,
-        tracks=configs["dataset"]["tracks"],
+        stage_2_maskp=configs["augmentation"]["stage_2_maskp"],
         required_labels=configs["dataset"]["required_labels"],
     )
     return ds
-
-
-def loadStage2Dataset(configs):
-    with open(configs["dataset"]["path"], "rb") as f:
-        t = pickle.load(f)
-
-    ds = VirusDataset.Stage2DataModule(
-        data=t,
-        batch_size=configs["train"]["batch_size"],
-        validate_size=configs["dataset"]["dataset_val_sample"],
-        seed=configs["dataset"]["seed"],
-        seq=configs["dataset"]["seq"],
-        required_labels=configs["dataset"]["required_labels"],
-        mask=configs["dataset"]["mask"],
-        maskp=configs["dataset"]["maskp"],
-    )
-
-    return ds
-
-
-LOAD_DATASET = {
-    "esm3ae": loadBalancedDatasetesm3ae,
-    "esm3cg": loadStage2Dataset,
-}
-
-
-def loadDataset(configs) -> pytorch_lightning.LightningDataModule:
-    # dataset = "esm2"
-    if "dataset" in configs:
-        dataset = configs["dataset"]["type"]
-    else:
-        raise ValueError("dataset type not given")
-
-    if dataset in LOAD_DATASET:
-        return LOAD_DATASET[dataset](configs)
-    else:
-        raise NotImplementedError
-
-
-def buildAutoEncoder(configs, model):
-    if "clf_params" not in configs["model"]:
-        configs["model"]["clf_params"] = {}
-
-    with open(configs["model"]["ori_seq"], "rb") as f:
-        ori_seqs = pickle.load(f)
-
-    if "lr_backbone" not in configs["model"]:
-        configs["model"]["lr_backbone"] = None
-
-    ae = modules.AutoEncoder(
-        model,
-        lr=configs["model"]["lr"],
-        lr_backbone=configs["model"]["lr_backbone"],
-        weight_decay=configs["model"]["weight_decay"],
-        classes=configs["model"]["classes"],
-        clf_params=configs["model"]["clf_params"],
-        masked_weight=configs["model"]["masked_weight"],
-        label_weights=configs["model"]["label_weights"],
-        transformer_layers=configs["model"]["transformer_layers"],
-        ori_seqs=ori_seqs,
-        l=configs["model"]["l"][0],
-        tf=configs["model"]["teaching force"][0],
-    )
-    return ae
-
-
-def buildCrossGeneModel(configs, model=None):
-    model = modules.CrossGeneModel(
-        in_channels=configs["model"]["in_channels"],
-        lr=configs["model"]["lr"],
-        weight_decay=configs["model"]["weight_decay"],
-        masked_weight=configs["model"]["masked_weight"],
-        seq=configs["model"]["seq"],
-    )
-    return model
-
-
-BUILD_MODEL = {
-    "stage1": buildAutoEncoder,
-    "stage2": buildCrossGeneModel,
-    # "esm3": buildesm3Model,
-}
 
 
 def buildModel(
@@ -242,24 +209,17 @@ def buildModel(
     if "type" in configs["model"]:
         model = configs["model"]["type"]
 
-    if model in BUILD_MODEL:
-        model = BUILD_MODEL[model](configs, basemodel)
-    else:
-        raise NotImplementedError
+    with open(configs["model"]["ori_seq"], "rb") as f:
+        ori_seq = pickle.load(f)
 
+    configs["model"]["params"]["ori_seqs"] = ori_seq
+
+    config = modules.VESMConfig(**configs["model"]["params"])
+    stage = configs["model"]["stage"]
+    model = modules.VESM(basemodel, stage, config)
     if checkpoint is not None:
         t = torch.load(checkpoint, map_location="cpu")
         model.load_state_dict(t["state_dict"], strict=False)
-        gs = t["global_step"]
-        if "unfreeze" in configs["pretrain_model"]:
-            t = configs["pretrain_model"]["unfreeze"]["steps"]
-            idx = np.argsort(t)
-            idx = filter(lambda x: t[x] < gs, idx)
-            model.load_freeze = [
-                configs["pretrain_model"]["unfreeze"]["layers"][i] for i in idx
-            ]
-    else:
-        model.load_freeze = None
 
     return model
 
@@ -294,6 +254,9 @@ def buildTrainer(configs, args):
 
     if "val_check_interval" not in configs["train"]:
         configs["train"]["val_check_interval"] = None
+
+    if "gradient_clip_val" not in configs["train"]:
+        configs["train"]["gradient_clip_val"] = None
 
     trainer = pytorch_lightning.Trainer(
         strategy=args.strategy,

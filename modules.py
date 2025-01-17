@@ -78,6 +78,39 @@ class DecoderBlock(nn.Module):
         return x
 
 
+class Linearlayer(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout=0.2, layer_norm=False, activate="gelu"):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        if layer_norm is not None:
+            self.ln = nn.LayerNorm(out_dim)
+        else:
+            self.ln = None
+        if dropout > 0 and dropout < 1:
+            self.dropout = nn.Dropout(p=dropout)
+        else:
+            self.dropout = None
+        if activate == "gelu":
+            self.activate = nn.GELU()
+        elif activate == "relu":
+            self.activate = nn.ReLU()
+        elif activate == "leakyrelu":
+            self.activate = nn.LeakyReLU()
+        else:
+            self.activate = nn.Identity()
+            # raise ValueError("activate %s not supported" % acivate)
+        # self.activate = activate
+
+    def forward(self, x):
+        x = self.linear(x)
+        if self.ln is not None:
+            x = self.ln(x)
+        x = self.activate(x)
+        if self.dropout is not None:
+            x = self.dropout(x)
+        return x
+
+
 class Linearcls(nn.Module):
     """simple linear classifier
 
@@ -86,30 +119,62 @@ class Linearcls(nn.Module):
     """
 
     def __init__(
-        self, input_dim=256, take_embed="first", dropout=-1, p0=None, output_dim=1
+        self,
+        input_dim=256,
+        take_embed="first",
+        dropout=-1,
+        p0=None,
+        output_dim=1,
+        hidden_dim=256,
+        hidden_layer=-1,
+        activate="gelu",
+        layer_norm=True,
     ):
         super().__init__()
 
-        assert take_embed in ["first", "mean", "max", "last"]
+        assert take_embed in ["first", "mean", "max"]
         self.embed_dim = input_dim
         self.dropout = dropout
         self.take_embed = take_embed
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
 
-        self.l1 = nn.Linear(self.embed_dim, self.embed_dim // 2)
-        self.l2 = nn.Linear(self.embed_dim // 2, self.embed_dim // 4)
-        self.l3 = nn.Linear(self.embed_dim // 4, output_dim)
-        self.ln1 = nn.LayerNorm(self.embed_dim // 2)
-        self.ln2 = nn.LayerNorm(self.embed_dim // 4)
+        if hidden_layer == -1:
+            self.l1 = nn.Linear(self.embed_dim, self.embed_dim // 2)
+            self.l2 = nn.Linear(self.embed_dim // 2, self.embed_dim // 4)
+            self.l3 = nn.Linear(self.embed_dim // 4, output_dim)
+            self.ln1 = nn.LayerNorm(self.embed_dim // 2)
+            self.ln2 = nn.LayerNorm(self.embed_dim // 4)
+
+            if dropout > 0 and dropout < 1:
+                self.dropout1 = nn.Dropout(p=self.dropout)
+                self.dropout2 = nn.Dropout(p=self.dropout)
+            else:
+                self.dropout1 = None
+                self.dropout2 = None
+            self.layers = None
+        else:
+
+            in_dims = [input_dim] + [hidden_dim] * (hidden_layer)
+            output_dims = [hidden_dim] * (hidden_layer + 1)
+            self.layers = nn.ModuleList(
+                [
+                    Linearlayer(
+                        in_dims[i],
+                        output_dims[i],
+                        dropout=dropout,
+                        layer_norm=layer_norm,
+                        activate=activate,
+                    )
+                    for i in range(len(in_dims))
+                ]
+            )
+            self.output = nn.Linear(hidden_dim, output_dim)
+
         if p0 is None:
             self.p0 = None
         else:
             self.p0 = nn.Dropout(p0)
-        if dropout > 0 and dropout < 1:
-            self.dropout1 = nn.Dropout(p=self.dropout)
-            self.dropout2 = nn.Dropout(p=self.dropout)
-        else:
-            self.dropout1 = None
-            self.dropout2 = None
 
     def forward(self, x: torch.Tensor):
 
@@ -120,29 +185,36 @@ class Linearcls(nn.Module):
         elif self.take_embed == "max":
             x = x.transpose(1, 2)
             x = F.adaptive_max_pool1d(x, 1)
-        elif self.take_embed == "last":
-            x = x[:, -1]
-        else:
-            raise NotImplementedError
 
         if self.p0 is not None:
             x = self.p0(x)
 
-        x = self.l1(x)
-        x = self.ln1(x)
-        if self.dropout1 is not None:
-            x = self.dropout1(x)
-        x = F.gelu(x)
-        x = self.l2(x)
-        x = self.ln2(x)
-        if self.dropout2 is not None:
-            x = self.dropout2(x)
-        x = F.gelu(x)
-        x = self.l3(x)
+        if self.layers is None:
+            x = self.l1(x)
+            x = self.ln1(x)
+            if self.dropout1 is not None:
+                x = self.dropout1(x)
+            x = F.gelu(x)
+            x = self.l2(x)
+            x = self.ln2(x)
+            if self.dropout2 is not None:
+                x = self.dropout2(x)
+            x = F.gelu(x)
+            x = self.l3(x)
+            return x
+
+        for layer in self.layers:
+            x = layer(x)
         # print("lin", x.shape)
+        x = self.output(x)
         return x
+        if self.output_dim == 1:
+            return x
+        else:
+            return x[:, 0], x[:, 1:]
 
 
+# deprecated
 class CrossGeneModel(L.LightningModule):
     def __init__(
         self,
@@ -392,6 +464,7 @@ class CrossGeneModel(L.LightningModule):
         return optimizer
 
 
+# deprecated
 class AutoEncoder(L.LightningModule):
     def __init__(
         self,
@@ -700,11 +773,11 @@ class VESMConfig:
     out_channels: int = 256
     aa_counts: int = 33
     stage_1_transformer_layers: int = 3
-    stage_1_clf_hidden_dim: int
+    stage_1_clf_hidden_dim: int = 128
     teaching_force: float = 0.5
 
     # stage 2
-    stage_2_clf_hidden_dim: int
+    stage_2_clf_hidden_dim: int = 128
     n_head: int = 16
     stage_2_transformer_layers: int = 5
 
@@ -763,7 +836,7 @@ class VESM(L.LightningModule):
         super().__init__()
 
         assert stage in [
-            "trainint stage 1",
+            "training stage 1",
             "training stage 2",
             "training stage 1 + stage 2",
             "inference",
@@ -780,7 +853,7 @@ class VESM(L.LightningModule):
         )
 
         self.stage_1_reconstructor = DecoderBlock(
-            config.esm_model_channels,
+            config.out_channels,
             config.n_head,
             config.aa_counts,
             config.stage_1_transformer_layers,
@@ -797,7 +870,6 @@ class VESM(L.LightningModule):
         self.stage_1_regressors = Stage1Regressors(
             config.out_channels,
             config.stage_1_clf_hidden_dim,
-            config.stage1_downstream_task_dim,
         )
 
         # stage 2 modules
@@ -818,7 +890,6 @@ class VESM(L.LightningModule):
         self.stage_2_regressors = Stage2Regressors(
             config.out_channels,
             config.stage_2_clf_hidden_dim,
-            config.stage_2_downstream_task_dim,
         )
 
         self.stage_2_reconstructor = DecoderBlock(
@@ -836,6 +907,7 @@ class VESM(L.LightningModule):
         self.cross_entropy = nn.CrossEntropyLoss(reduction="none")
         self.training_step_outputs = []
         self.validation_step_outputs = []
+        self.last_train_step = 0
 
     # masks not used
     def stage1_forward(self, input_dict, masks=None):
@@ -873,9 +945,10 @@ class VESM(L.LightningModule):
                 l = min(x.shape[1], q.shape[1])
                 if x.shape[1] < q.shape[1]:
                     q[:, :l, :] += x[:, :l, :]
-                    x = q
+                    x = q[:, :l, :]
                 else:
                     x[:, :l, :] += q[:, :l, :]
+
             x = self.stage_1_reconstructor(x)
             stage_1_logits[i] = x
 
@@ -998,28 +1071,30 @@ class VESM(L.LightningModule):
 
     def stage1_frabricated_loss(self, output, input_dict):
         stage_1_frabricated_loss = {}
+        if "label" not in input_dict:
+            return stage_1_frabricated_loss
         for i in output.S1Predicts:
-            t = input_dict["labels"][i]
+            t = input_dict["label"][i][0].float()
             if t.dim() == 1:
                 t = t.unsqueeze(0)
             loss = self.bce(
                 output.S1Predicts[i]["fabricated"],
-                input_dict["labels"][i],
+                t,
             )
             stage_1_frabricated_loss[i] = loss
         return stage_1_frabricated_loss
 
     def stage1_logit_loss(self, output: VESMOutputs, input_dict):
         stage_1_logitLosses = {}
-        if "ori_inputs" not in input_dict:
+        if "ori_seq" not in input_dict:
             return stage_1_logitLosses
         for i in output.S1Logits:
-            loss = self.cross_entropy(
-                output.S1Logits[i].flatten(),
-                input_dict["ori_inputs"][i].flatten(),
-            )
+            s1 = output.S1Logits[i]
+            s1 = s1.view(-1, s1.shape[-1])
+            l1 = input_dict["ori_seq"][i].flatten()
+            loss = self.cross_entropy(s1, l1)
             if input_dict["stage_1_masks"] is not None:
-                mask = input_dict["stage_1_masks"][i].flatten()
+                mask = input_dict["stage_1_masks"][i].flatten().float()
                 mask = 1 - mask
                 mask[mask < 0] = -self.config.stage_1_masked_weight
                 mask += self.config.stage_1_masked_weight
@@ -1051,13 +1126,13 @@ class VESM(L.LightningModule):
             stage_2_logitLosses[i] = loss
         return stage_2_logitLosses
 
-    def stage2_time_series_loss(self, output1, output2):
+    def stage2_time_series_loss(self, output1: VESMOutputs, output2: VESMOutputs):
         t1 = output1.S2Predicts["time_series"]
         t2 = output2.S2Predicts["time_series"]
         t = t2 - t1
         return self.bce(t, torch.ones_like(t))
 
-    def stage2_reconstruct_loss(self, output, input_dict):
+    def stage2_reconstruct_loss(self, output: VESMOutputs, input_dict):
         stage_2_reconstruct_loss = {}
         for i in output.S2Reconstruct:
             loss = self.mse(
@@ -1070,15 +1145,15 @@ class VESM(L.LightningModule):
 
     def getLoss(self, input_dict1, input_dict2=None):
         output1 = self.forward(
-            input_dict1["inputs"],
-            input_dict1["stage_1_masks"],
-            input_dict1["stage_2_masks"],
+            input_dict1["input"],
+            input_dict1.get("stage_1_masks", None),
+            input_dict1.get("stage_2_masks", None),
         )
         if input_dict2 is not None:
             output2 = self.forward(
-                input_dict2["inputs"],
-                input_dict2["stage_1_masks"],
-                input_dict2["stage_2_masks"],
+                input_dict2["input"],
+                input_dict2.get("stage_1_masks", None),
+                input_dict2.get("stage_2_masks", None),
             )
         else:
             output2 = None
@@ -1092,15 +1167,23 @@ class VESM(L.LightningModule):
             s = self.stage1_logit_loss(output2, input_dict2)
             for i in s:
                 stage_1_logitLosses[i + "_2"] = s[i]
+        if "label" in input_dict1:
+            stage_1_frabricated_loss = self.stage1_frabricated_loss(
+                output1, input_dict1
+            )
+        else:
+            stage_1_frabricated_loss = {}
 
-        stage_1_frabricated_loss = self.stage1_frabricated_loss(output1, input_dict1)
         for i in stage_1_frabricated_loss:
             stage_1_predictLosses[i + "_fabricated_1"] = stage_1_frabricated_loss[i]
 
         if output2 is not None:
-            stage_1_frabricated_loss = self.stage1_frabricated_loss(
-                output2, input_dict2
-            )
+            if "label" in input_dict2:
+                stage_1_frabricated_loss = self.stage1_frabricated_loss(
+                    output2, input_dict2
+                )
+            else:
+                stage_1_frabricated_loss = {}
             for i in stage_1_frabricated_loss:
                 stage_1_predictLosses[i + "_fabricated_2"] = stage_1_frabricated_loss[i]
 
@@ -1204,7 +1287,7 @@ class VESM(L.LightningModule):
         raise NotImplementedError
 
     def training_step(self, batch, batch_idx):
-        if isinstance(batch, tuple):
+        if isinstance(batch, list):
             input_dict1, input_dict2 = batch
         else:
             input_dict1 = batch
@@ -1217,7 +1300,7 @@ class VESM(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if isinstance(batch, tuple):
+        if isinstance(batch, list):
             input_dict1, input_dict2 = batch
         else:
             input_dict1 = batch
@@ -1271,6 +1354,8 @@ class VESM(L.LightningModule):
 
         for i in res:
             self.log(i, res[i], prog_bar=True)
+
+        self.last_train_step = len(self.training_step_outputs)
 
     def configure_optimizers(self):
         if self.config.lr_backbone is not None:
@@ -1329,16 +1414,16 @@ class ESMModule(nn.Module):
             return x
 
         if self.esm_model_type == "esm2":
-            assert "seq_t" in input_dict
-            t = input_dict["seq_t"]
-            representations = self.esm_model(t, repr_layers=[self.num_layers])
+            # assert "seq_t" in input_dict
+            # t = input_dict["seq_t"]
+            representations = self.esm_model(input_dict, repr_layers=[self.num_layers])
 
             x = representations["representations"][self.num_layers][:, 0]
             return x
 
         if self.esm_model_type == "esmc":
-            assert "seq_t" in input_dict
-            t = input_dict["seq_t"]
+            # assert "seq_t" in input_dict
+            t = input_dict
             if len(t.size()) == 1:
                 t = t.unsqueeze(0)
 
