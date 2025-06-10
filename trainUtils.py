@@ -198,6 +198,7 @@ def loadDataset(configs) -> pytorch_lightning.LightningDataModule:
         aug=aug,
         stage_2_maskp=configs["augmentation"]["stage_2_maskp"],
         required_labels=configs["dataset"]["required_labels"],
+        train_time_series=configs["dataset"]["train_time_series"],
     )
     return ds
 
@@ -209,15 +210,24 @@ def buildModel(
     if "type" in configs["model"]:
         model = configs["model"]["type"]
 
-    with open(configs["model"]["ori_seq"], "rb") as f:
-        ori_seq = pickle.load(f)
+    if "ori_seq" in configs["model"]["params"]:
+        with open(configs["model"]["ori_seq"], "rb") as f:
+            ori_seq = pickle.load(f)
 
-    configs["model"]["params"]["ori_seqs"] = ori_seq
+        configs["model"]["params"]["ori_seqs"] = ori_seq
+    else:
+        configs["model"]["params"]["ori_seqs"] = {}
 
     config = modules.VESMConfig(**configs["model"]["params"])
     stage = configs["model"]["stage"]
     model = modules.VESM(basemodel, stage, config)
+    if "checkpoint" in configs["model"] and configs["model"]["checkpoint"]:
+        print("load model from checkpoint", configs["model"]["checkpoint"])
+        model.load_state_dict(
+            torch.load(configs["model"]["checkpoint"])["state_dict"], strict=False
+        )
     if checkpoint is not None:
+        print("load model from checkpoint", checkpoint)
         t = torch.load(checkpoint, map_location="cpu")
         model.load_state_dict(t["state_dict"], strict=False)
 

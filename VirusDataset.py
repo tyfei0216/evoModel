@@ -287,7 +287,7 @@ class BaseDataset(Dataset):
         num = np.random.binomial(len(sample) - 2, p)
         pos = self._generateMaskingPos(num, len(sample), exclude=avoid)
         for i in pos:
-            sample[i] = self.getToken("seq_t", random.sample(self.aug.vocab, 1)[0])
+            sample[i] = self.getToken(random.sample(self.aug.vocab, 1)[0])
 
         return sample, pos
 
@@ -315,7 +315,7 @@ class BaseDataset(Dataset):
 
         if aug_parameters["maskp"] > 0:
             sample, mask = self._maskSequence(
-                sample, mask, aug_parameters["maskp"], avoid
+                sample, mask, aug_parameters["maskp"], "point", avoid
             )
 
         if aug_parameters["maskpc"] > 0:
@@ -375,6 +375,7 @@ class VESMDataset(BaseDataset):
             required_labels,
         )
         assert stage in [
+            "pretraining stage 1",
             "training stage 1",
             "training stage 2",
             "training stage 1 + stage 2",
@@ -424,7 +425,7 @@ class VESMDataset(BaseDataset):
         mask[pos] = IGNORE_TOKEN
         return mask, pos
 
-    def getToken(self, track, token):
+    def getToken(self, token, track="seq_t"):
         # assert token in ["start", "end", "mask"]
         match token:
             case "start":
@@ -633,6 +634,7 @@ class VESMDataModule(L.LightningDataModule):
     ):
         super().__init__()
         assert stage in [
+            "pretraining stage 1",
             "training stage 1",
             "training stage 2",
             "training stage 1 + stage 2",

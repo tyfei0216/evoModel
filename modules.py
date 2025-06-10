@@ -836,12 +836,16 @@ class VESM(L.LightningModule):
         super().__init__()
 
         assert stage in [
+            "pretraining stage 1",
             "training stage 1",
             "training stage 2",
             "training stage 1 + stage 2",
             "inference",
         ]
         self.stage = stage
+
+        print("model at stage:", stage)
+
         self.config = config
         self.prots = config.prots
 
@@ -909,7 +913,6 @@ class VESM(L.LightningModule):
         self.validation_step_outputs = []
         self.last_train_step = 0
 
-    # masks not used
     def stage1_forward(self, input_dict, masks=None):
         stage_1_embeds = {}
         stage_1_logits = {}
@@ -928,7 +931,7 @@ class VESM(L.LightningModule):
             stage_1_embeds[i] = embed
 
             predicts = self.stage_1_regressors(embed)
-            if self.stage == "infernce":
+            if self.stage == "inference":
                 # predicts.pop("time_series")
                 predicts.pop("fabricated")
             stage_1_predicts[i] = predicts
@@ -936,11 +939,18 @@ class VESM(L.LightningModule):
             x = embed[:, None].repeat(1, length, 1)
 
             if (
-                self.stage == "training stage 1"
-                and self.config.teaching_force > 0
+                (
+                    self.stage == "training stage 1"
+                    or self.stage == "pretraining stage 1"
+                )
+                and self.config.teaching_force > 0.0
                 and random.random() < self.config.teaching_force
             ):
-                q = getattr(self, "ori_seq_" + i)[None, :].repeat(batchsize, 1)
+                if self.stage == "pretraining stage 1":
+                    q = input_dict[i]
+                else:
+                    q = getattr(self, "ori_seq_" + i)[None, :].repeat(batchsize, 1)
+
                 q = self.stage_1_embed(q)
                 l = min(x.shape[1], q.shape[1])
                 if x.shape[1] < q.shape[1]:
@@ -948,7 +958,7 @@ class VESM(L.LightningModule):
                     x = q[:, :l, :]
                 else:
                     x[:, :l, :] += q[:, :l, :]
-
+            # print(x.shape, stage_1_ori_embeds[i].shape)
             x = self.stage_1_reconstructor(x)
             stage_1_logits[i] = x
 
@@ -967,7 +977,7 @@ class VESM(L.LightningModule):
         masked = torch.zeros(batch_size, self.config.out_channels).to(self.device)
         for i in self.prots:
             if i in stage_1_embeds and i not in masks:
-                inputs.append(stage_1_embeds[i])
+                inputs.append(stage_1_embeds[i][:, 0, :])
             else:
                 inputs.append(masked)
         inputs.append(masked)
@@ -992,7 +1002,7 @@ class VESM(L.LightningModule):
             l = min(x.shape[1], q.shape[1])
             if x.shape[1] < q.shape[1]:
                 q[:, :l, :] += x[:, :l, :]
-                x = q
+                x = q[:, :l, :]
             else:
                 x[:, :l, :] += q[:, :l, :]
             x = self.stage_2_reconstructor(x)
@@ -1011,12 +1021,14 @@ class VESM(L.LightningModule):
 
         return stage_2_embeddings, stage_2_reconstruct, stage_2_logits, stage_2_predicts
 
-    def forward(self, input_dict, stage_1_masks=None, stage_2_masks=None):
+    def forward(
+        self, input_dict, stage_1_masks=None, stage_2_masks=None, only_stage_1=False
+    ):
         if "stage 1" in self.stage:
             stage_1_ori_embeds, stage_1_embeds, stage_1_logits, stage_1_predicts = (
                 self.stage1_forward(input_dict, stage_1_masks)
             )
-            if self.stage == "training stage 1":
+            if self.stage == "training stage 1" or self.stage == "pretraining stage 1":
                 return VESMOutputs(
                     S1Embeddings=stage_1_embeds,
                     S1Logits=stage_1_logits,
@@ -1031,6 +1043,17 @@ class VESM(L.LightningModule):
                 stage_1_ori_embeds, stage_1_embeds, stage_1_logits, stage_1_predicts = (
                     self.stage1_forward(input_dict, stage_1_masks)
                 )
+
+        if only_stage_1:
+            return VESMOutputs(
+                S1Embeddings=stage_1_embeds,
+                S1Logits=stage_1_logits,
+                S1Predicts=stage_1_predicts,
+                S2Embeddings=None,
+                S2Reconstruct=None,
+                S2Logits=None,
+                S2Predicts=None,
+            )
 
         if "stage 2" in self.stage:
 
@@ -1093,7 +1116,10 @@ class VESM(L.LightningModule):
             s1 = s1.view(-1, s1.shape[-1])
             l1 = input_dict["ori_seq"][i].flatten()
             loss = self.cross_entropy(s1, l1)
-            if input_dict["stage_1_masks"] is not None:
+            if (
+                "stage_1_masks" in input_dict
+                and input_dict["stage_1_masks"] is not None
+            ):
                 mask = input_dict["stage_1_masks"][i].flatten().float()
                 mask = 1 - mask
                 mask[mask < 0] = -self.config.stage_1_masked_weight
@@ -1107,15 +1133,20 @@ class VESM(L.LightningModule):
 
     def stage2_logit_loss(self, output: VESMOutputs, input_dict):
         stage_2_logitLosses = {}
-        if "ori_inputs" not in input_dict:
+        if "ori_seq" not in input_dict:
             return stage_2_logitLosses
         for i in output.S2Logits:
-            loss = self.cross_entropy(
-                output.S2Logits[i].flatten(),
-                input_dict["ori_inputs"][i].flatten(),
-            )
-            if input_dict["stage_1_masks"] is not None:
-                mask = input_dict["stage_1_masks"][i].flatten()
+
+            s1 = output.S2Logits[i]
+            s1 = s1.view(-1, s1.shape[-1])
+            l1 = input_dict["ori_seq"][i].flatten()
+            loss = self.cross_entropy(s1, l1)
+
+            if (
+                "stage_1_masks" in input_dict
+                and input_dict["stage_1_masks"] is not None
+            ):
+                mask = input_dict["stage_1_masks"][i].flatten().float()
                 mask = 1 - mask
                 mask[mask < 0] = -self.config.stage_1_masked_weight
                 mask += self.config.stage_1_masked_weight
@@ -1142,8 +1173,10 @@ class VESM(L.LightningModule):
             if i in input_dict["stage_2_masks"]:
                 loss *= self.config.stage_2_masekd_weight
             stage_2_reconstruct_loss[i] = loss
+        return stage_2_reconstruct_loss
 
     def getLoss(self, input_dict1, input_dict2=None):
+
         output1 = self.forward(
             input_dict1["input"],
             input_dict1.get("stage_1_masks", None),
@@ -1158,6 +1191,7 @@ class VESM(L.LightningModule):
         else:
             output2 = None
 
+        # stage 1 losses
         stage_1_logitLosses = {}
         stage_1_predictLosses = {}
         s = self.stage1_logit_loss(output1, input_dict1)
@@ -1167,7 +1201,7 @@ class VESM(L.LightningModule):
             s = self.stage1_logit_loss(output2, input_dict2)
             for i in s:
                 stage_1_logitLosses[i + "_2"] = s[i]
-        if "label" in input_dict1:
+        if "label" in input_dict1 and self.stage != "pretraining stage 1":
             stage_1_frabricated_loss = self.stage1_frabricated_loss(
                 output1, input_dict1
             )
@@ -1192,7 +1226,7 @@ class VESM(L.LightningModule):
             for i in s:
                 stage_1_predictLosses[i + "_time_series"] = s[i]
 
-        if self.stage == "training stage 1":
+        if self.stage == "training stage 1" or self.stage == "pretraining stage 1":
             return VESMLosses(
                 S1PredictsLosses=stage_1_predictLosses,
                 S1LogitsLosses=stage_1_logitLosses,
@@ -1201,6 +1235,25 @@ class VESM(L.LightningModule):
                 S2PredictsLoss=None,
             )
 
+        if self.stage == "training stage 1 + stage 2" and "ori_seq" in input_dict1:
+            with torch.no_grad():
+                ori_output1 = self.forward(
+                    input_dict1["ori_seq"],
+                    input_dict1.get("stage_1_masks", None),
+                    only_stage_1=True,
+                )
+                output1.S1Embeddings = ori_output1.S1Embeddings
+
+            if input_dict2 is not None:
+                with torch.no_grad():
+                    ori_output2 = self.forward(
+                        input_dict2["ori_seq"],
+                        input_dict2.get("stage_1_masks", None),
+                        only_stage_1=True,
+                    )
+                    output2.S1Embeddings = ori_output2.S1Embeddings
+
+        # stage 2 losses
         stage_2_reconstruct_loss = {}
         s = self.stage2_reconstruct_loss(output1, input_dict1)
         for i in s:
@@ -1234,8 +1287,11 @@ class VESM(L.LightningModule):
     def _common_training_step(self, input_dict1, input_dict2=None):
         loss = self.getLoss(input_dict1, input_dict2)
 
-        if self.stage == "training stage 1":
-            loss1 = sum([i for i in loss.S1PredictsLosses.values()])
+        if self.stage == "training stage 1" or self.stage == "pretraining stage 1":
+            if len(loss.S1PredictsLosses) == 0:
+                loss1 = torch.tensor((0.0))
+            else:
+                loss1 = sum([i for i in loss.S1PredictsLosses.values()])
             loss2 = sum([i for i in loss.S1LogitsLosses.values()])
             loss = loss1 * self.config.stage_1_regressor_weight + loss2
             d = {
@@ -1387,6 +1443,19 @@ class VESM(L.LightningModule):
                 backbones.append(i)
         for i in backbones:
             del checkpoint["state_dict"][i]
+
+    def predict_step(self, input_dict):
+        if "input" in input_dict:
+            output1 = self.forward(
+                input_dict["input"],
+                input_dict.get("stage_1_masks", None),
+                input_dict.get("stage_2_masks", None),
+            )
+            return output1
+
+        else:
+            output1 = self.forward(input_dict)
+            return output1
 
 
 class ESMModule(nn.Module):
