@@ -210,13 +210,13 @@ def buildModel(
     if "type" in configs["model"]:
         model = configs["model"]["type"]
 
-    if "ori_seq" in configs["model"]["params"]:
-        with open(configs["model"]["ori_seq"], "rb") as f:
-            ori_seq = pickle.load(f)
+    # if "ori_seq" in configs["model"]["params"]:
+    #     with open(configs["model"]["ori_seq"], "rb") as f:
+    #         ori_seq = pickle.load(f)
 
-        configs["model"]["params"]["ori_seqs"] = ori_seq
-    else:
-        configs["model"]["params"]["ori_seqs"] = {}
+    #     configs["model"]["params"]["ori_seqs"] = ori_seq
+    # else:
+    #     configs["model"]["params"]["ori_seqs"] = {}
 
     config = modules.VESMConfig(**configs["model"]["params"])
     stage = configs["model"]["stage"]

@@ -287,7 +287,10 @@ class BaseDataset(Dataset):
         num = np.random.binomial(len(sample) - 2, p)
         pos = self._generateMaskingPos(num, len(sample), exclude=avoid)
         for i in pos:
-            sample[i] = self.getToken(random.sample(self.aug.vocab, 1)[0])
+            t = sample[i]
+            while t == sample[i]:
+                t = self.getToken(random.sample(self.aug.vocab, 1)[0])
+            sample[i] = t
 
         return sample, pos
 
@@ -295,19 +298,29 @@ class BaseDataset(Dataset):
     def _generateMask(self, sample):
         pass
 
-    def _augmentSample(self, sample, aug_parameters):
+    def _augmentSample(self, sample, aug_parameters, aligned_seq=None):
         ret = {}
+
         ret["parameters"] = aug_parameters
+
+        if aligned_seq is not None:
+            ret["aligned"] = aligned_seq
+            ret["mutation_label"] = (aligned_seq != sample).astype(np.int64)
+        else:
+            ret["mutation_label"] = np.zeros_like(sample, dtype=np.int64)
 
         sample = sample.copy()
 
+        # do not use crop
         sample = self._cropSequence(sample, aug_parameters["crop"])
 
         mask, avoid = self._generateMask(sample)
-
         sample, pos = self._mutateSample(sample, aug_parameters["mutatep"], avoid)
 
         ret["mutate_pos"] = pos
+
+        if len(pos) > 0:
+            ret["mutation_label"][pos] = 2
 
         avoid = np.concatenate([avoid, pos])
 
@@ -328,24 +341,31 @@ class BaseDataset(Dataset):
 
         return ret
 
-    def processSeq(self, sample):
+    def processSeq(self, sample, aligned_seq=None):
         if self.aug is not None and self.ifaug:
             aug_parameters = self.aug.getAugmentationParameters(
                 len(sample), self.step_cnt
             )
-            ret = self._augmentSample(sample, aug_parameters)
+            ret = self._augmentSample(sample, aug_parameters, aligned_seq)
         else:
             ret = {}
             ret["parameters"] = {}
             ret["sample"] = sample.copy()
             ret["ori_seq"] = sample.copy()
             ret["mutate_pos"] = []
+            if aligned_seq is not None:
+                ret["aligned"] = aligned_seq
+                ret["mutation_label"] = (aligned_seq != sample).astype(np.int64)
+            else:
+                # ret["aligned"] = None
+                ret["mutation_label"] = np.zeros_like(sample, dtype=np.int64)
             ret["mask"], _ = self._generateMask(sample)
         return ret
 
-    def prepareLabels(self, sample, labels):
-        if not isinstance(labels, list):
-            labels = [labels]
+    def prepareLabels(self, sample):
+        # if not isinstance(labels, list):
+        #     labels = [labels]
+        labels = []
         for i in self.required_labels:
             if "classes" in sample and i in sample["sample"]["classes"]:
                 labels.append(sample["classes"][i])
@@ -512,13 +532,29 @@ class VESMDataset(BaseDataset):
     def getSample(self, data, input_idx):
         sample = {}
         sample["input"] = {}
+        sample["aligned"] = {}
         sample["meta"] = {}
         if "stage 2" in self.stage:
             for i in self.seq:
-                sample["input"][i] = data[i]
+                d1 = data[i]
+                d2 = data["aligned_" + i]
+                if len(d1) < len(d2):
+                    d2 = d2[: len(d1)]
+                else:
+                    d1 = d1[: len(d2)]
+                sample["input"][i] = d1
+                sample["aligned"][i] = d2
+
         else:
             q = self.seq[input_idx % len(self.seq)]
-            sample["input"][q] = data[q]
+            d1 = data[q]
+            d2 = data["aligned_" + q]
+            if len(d1) < len(d2):
+                d2 = d2[: len(d1)]
+            else:
+                d1 = d1[: len(d2)]
+            sample["input"][q] = d1
+            sample["aligned"][q] = d2
         for i in ["id", "bin", "days"]:
             sample["meta"][i] = data[i]
         return sample
@@ -575,14 +611,19 @@ class VESMDataset(BaseDataset):
         if "stage 1" in self.stage:
             x1["stage_1_masks"] = {}
             x1["label"] = {}
+            x1["mutation_label"] = {}
             for i in t["input"]:
                 seq = t["input"][i]
-                ret = self.processSeq(seq)
+                align_seq = t["aligned"][i]
+                ret = self.processSeq(seq, aligned_seq=align_seq)
                 x1["input"][i] = ret["sample"]
+                x1["input"]["aligned_" + i] = ret["aligned"]
                 x1["ori_seq"][i] = ret["ori_seq"]
                 x1["stage_1_masks"][i] = ret["mask"]
+                # print(ret)
+                x1["mutation_label"][i] = ret["mutation_label"]
                 # x1["label"][i] = np.array(len(ret["mutate_pos"]) > 0, dtype=int)
-                x1["label"][i] = self.prepareLabels(t, int(len(ret["mutate_pos"]) > 0))
+                x1["label"][i] = self.prepareLabels(t)
         else:
             # x1["stage_1_masks"] = None
             # x1["label"] = None
@@ -714,406 +755,14 @@ class VESMDataModule(L.LightningDataModule):
             num_workers=4,
         )
 
-
-# deprecated
-class BalancedDataset(BaseDataset):
-    def __init__(
-        self,
-        data,
-        tracks=["seq_t"],
-        return_mask=False,
-        aug: DataAugmentation = None,
-        sample_list=None,
-        required_labels=[],
-        shuffle=False,
-        update_pnt=True,
-    ) -> None:
-        super().__init__(
-            tracks,
-            return_mask,
-            aug,
-            required_labels,
-        )
-        self.data = data
-        self.sample_list = sample_list
-        self.shuffle = shuffle
-        self.update_pnt = update_pnt
-
-        if sample_list is not None:
-            self.sample_list = sample_list
-            self._sample = True
-            for i in range(len(self.sample_list)):
-                if len(self.data[i]) < self.sample_list[i] or self.sample_list[i] < 0:
-                    self.sample_list[i] = len(self.data[i])
-        else:
-            self.sample_list = []
-            self._sample = False
-            for i in self.data:
-                self.sample_list.append(len(i))
-
-        self.data_order = []
-        for i in data:
-            self.data_order.append(np.arange(len(i)))
-
-        self.pnts = [0 for _ in data]
-
-    @property
-    def sample(self):
-        return self._sample
-
-    @sample.setter
-    def sample(self, v: bool):
-        assert isinstance(v, bool)
-
-        self._sample = v
-
-    def __len__(self):
-        if self._sample:
-            t = 0
-            for i in self.sample_list:
-                t += i
-            return t
-        else:
-            t = 0
-            for i in self.data:
-                t += len(i)
-                return t
-
-    def shuffleIndex(self):
-        for i in self.data_order:
-            random.shuffle(i)
-
-    def newEpoch(self):
-        # print("called new epoch")
-        if self.shuffle:
-            self.shuffleIndex()
-        if self.update_pnt:
-            for i in range(len(self.sample_list)):
-                self.pnts[i] += self.sample_list[i]
-                while self.pnts[i] >= len(self.data_order[i]):
-                    self.pnts[i] -= len(self.data_order[i])
-
-    def step(self):
-        self.step_cnt += 1
-
-    def resetCnt(self):
-        self.step_cnt = 0
-
-    def _getitemx1(self, idx):
-        if self.sample:
-            for i in range(len(self.sample_list)):
-                if idx - self.sample_list[i] < 0:
-                    return self.data[i][
-                        self.data_order[i][idx % len(self.data_order[i])]
-                    ]
-
-                else:
-                    idx -= self.sample_list[i]
-        else:
-            for i in self.data:
-                if idx - len(i) < 0:
-                    return i[idx]
-                else:
-                    idx -= len(i)
-        raise KeyError
-
-    def __getitem__(self, idx):
-        x1 = {}
-        t1 = self._getitemx1(idx)
-
-        x1 = self.processSample(t1)
-        if "mutated" in x1["parameters"]:
-            label = x1["parameters"]["mutated"]
-        else:
-            label = 0.0
-        labels = self.prepareLabels(t1, label)
-
-        s = x1["sample"]
-        # s["prot"] = x1["prot"]
-        s["mask"] = x1["mask"]
-
-        return s, labels
-
-
-# deprecated
-class ESM3MultiTrackAutoEncoderDataset(BalancedDataset):
-    def __init__(
-        self,
-        data,
-        augment: DataAugmentation = None,
-        sample_list=None,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
-        return_mask=True,
-        required_labels=[],
-        shuffle=False,
-        update_pnt=True,
-        ignore_token=["X", "<unk>", "<pad>", "|", "."],
-    ) -> None:
-        super().__init__(
-            data=data,
-            tracks=tracks,
-            return_mask=return_mask,
-            aug=augment,
-            sample_list=sample_list,
-            required_labels=required_labels,
-            shuffle=shuffle,
-            update_pnt=update_pnt,
-        )
-        self.ignore_token = []
-        for i in ignore_token:
-            self.ignore_token.append(C.SEQUENCE_VOCAB.index(i))
-
-    def generateMask(self, x):
-
-        ret = super().generateMask(x)
-        if "seq_t" in x:
-            q = x["seq_t"]
-            for i in range(len(q)):
-                if q[i] in self.ignore_token:
-                    ret[i] = IGNORE_TOKEN
-        return ret
-
-    def getToken(self, track, token):
-        # assert token in ["start", "end", "mask"]
-        match token:
-            case "start":
-                match track:
-                    case "seq_t":
-                        return C.SEQUENCE_BOS_TOKEN
-                    case "structure_t":
-                        return C.STRUCTURE_BOS_TOKEN
-                    case "sasa_t":
-                        return 0
-                    case "second_t":
-                        return 0
-                    case _:
-                        raise ValueError
-            case "end":
-                match track:
-                    case "seq_t":
-                        return C.SEQUENCE_EOS_TOKEN
-                    case "structure_t":
-                        return C.STRUCTURE_EOS_TOKEN
-                    case "sasa_t":
-                        return 0
-                    case "second_t":
-                        return 0
-                    case _:
-                        raise ValueError
-            case "mask":
-                match track:
-                    case "seq_t":
-                        return C.SEQUENCE_MASK_TOKEN
-                    case "structure_t":
-                        return C.STRUCTURE_MASK_TOKEN
-                    case "sasa_t":
-                        return C.SASA_UNK_TOKEN
-                    case "second_t":
-                        return C.SS8_UNK_TOKEN
-                    case _:
-                        raise ValueError("mask of %s is not found" % track)
-            case "pad":
-                match track:
-                    case "seq_t":
-                        return C.SEQUENCE_PAD_TOKEN
-                    case "structure_t":
-                        return C.STRUCTURE_PAD_TOKEN
-                    case "sasa_t":
-                        return C.SASA_PAD_TOKEN
-                    case "second_t":
-                        return C.SS8_PAD_TOKEN
-                    case _:
-                        raise ValueError
-            case _:
-                assert track == "seq_t"
-                assert token in C.SEQUENCE_VOCAB
-                return C.SEQUENCE_VOCAB.index(token)
-
-
-# deprecated
-class ESM3MultiTrackDataset(BaseDataset):
-
-    def __init__(
-        self,
-        data1,
-        data2,
-        label,
-        augment: DataAugmentation = None,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
-        # origin = {0:""},
-    ) -> None:
-        super().__init__(tracks=tracks)
-        self.data1 = data1
-        self.data2 = data2
-        self.label = label
-        self.aug = augment
-        self.iters = 0
-        self.data2order = np.arange(len(data2))
-        random.shuffle(self.data2order)
-        self.ifaug = False
-        # self.tracks = tracks
-
-    def __len__(self):
-        return len(self.data1)
-
-    def newEpoch(self):
-        random.shuffle(self.data2order)
-
-    # def step(self):
-    # random.shuffle(self.data2order)
-    # super().step()
-
-    def __getitem__(self, idx):
-        x1 = {}
-        x2 = {}
-        for i in self.tracks:
-            x1[i] = self.data1[idx][i]
-            x2[i] = self.data2[self.data2order[idx % len(self.data2)]][i]
-        if self.aug is not None and self.ifaug:
-            maskp, crop = self.aug.getAugmentation(
-                len(x1[self.tracks[0]]), self.step_cnt
-            )
-            x1 = self._augmentsample(x1, maskp, crop)
-        return x1, torch.tensor([self.label[idx]]), x2
-
-
-# deprecated
-class ESM3BalancedDataModule(L.LightningDataModule):
-    def __init__(
-        self,
-        data1,
-        batch_size=1,
-        sample_train=None,
-        sample_val=None,
-        train_test_ratio=[0.85, 0.15],
-        aug=None,
-        seed=1509,
-        tracks=["seq_t", "structure_t", "sasa_t", "second_t"],
-        required_labels=[],
-    ):
-        super().__init__()
-        self.value = 0
-        self.batch_size = batch_size
-        self.seed = seed
-
-        from sklearn.model_selection import train_test_split
-
-        self.traindata1 = []
-        self.train_indices1 = []
-        self.valdata1 = []
-        self.val_indices1 = []
-
-        L.seed_everything(self.seed)
-
-        for i in data1:
-            d1, v1, i1, i2 = train_test_split(
-                i,
-                range(len(i)),
-                train_size=train_test_ratio[0],
-                random_state=self.seed,
-            )
-            self.traindata1.append(d1)
-            self.valdata1.append(v1)
-            self.train_indices1.append(i1)
-            self.val_indices1.append(i2)
-
-        self.train_set = ESM3MultiTrackAutoEncoderDataset(
-            self.traindata1,
-            augment=aug,
-            sample_list=sample_train,
-            tracks=tracks,
-            required_labels=required_labels,
-        )
-
-        self.val_set = ESM3MultiTrackAutoEncoderDataset(
-            self.valdata1,
-            augment=aug,
-            sample_list=sample_val,
-            tracks=tracks,
-            required_labels=required_labels,
-        )
-
-    def train_dataloader(self):
+    def test_dataloader(self):
         self.value += 1
-        print("get train loader")
-        # return DataLoader(self.train_set, batch_size=self.batch_size, num_workers=4)
-        return MyDataLoader(
-            self.train_set,
-            True,
-            shuffle=True,
-            batch_size=self.batch_size,
-            num_workers=4,
-        )
-
-    def val_dataloader(self):
-        self.value += 1
-        print("get val loader")
-        return MyDataLoader(
+        print("get test loader")
+        self.val_set.ifaug = False
+        self.val_set.train_time_series = False
+        return DataLoader(
             self.val_set,
-            False,
             shuffle=False,
             batch_size=self.batch_size,
             num_workers=4,
-        )
-
-
-# deprecated
-class Stage2DataModule(L.LightningDataModule):
-    def __init__(
-        self,
-        data,
-        batch_size=1,
-        validate_size=1000,
-        seed=1509,
-        seq=["NSP5", "E", "S"],
-        required_labels=[],
-        mask=[0.25, 0.5, 1.0],
-        maskp=0.1,
-    ):
-        super().__init__()
-        # print(len(data))
-        self.batch_size = batch_size
-        self.seed = seed
-
-        from sklearn.model_selection import train_test_split
-
-        # self.traindata = []
-        # self.train_indices = []
-        # self.valdata = []
-        # self.val_indices = []
-        # L.seed_everything(self.seed)
-
-        self.traindata, self.valdata, self.train_indices, self.val_indices = (
-            train_test_split(
-                data,
-                range(len(data)),
-                test_size=validate_size,
-                random_state=self.seed,
-            )
-        )
-
-        self.train_set = BaseDataset2(
-            self.traindata,
-            required_labels=required_labels,
-            seq=seq,
-            mask=mask,
-            maskp=maskp,
-        )
-
-        self.val_set = BaseDataset2(
-            self.valdata,
-            required_labels=required_labels,
-            seq=seq,
-            mask=mask,
-            maskp=maskp,
-        )
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_set, batch_size=self.batch_size, num_workers=4, shuffle=True
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_set, batch_size=self.batch_size, num_workers=4, shuffle=False
         )
