@@ -18,4 +18,3 @@ tb_logs/
 temp_inference_results/
 
 # --- Specific Files  ---
-*.ipynb
