@@ -1,0 +1,21 @@
+# --- Python Cache ---
+__pycache__/
+
+# --- Directories ---
+2025review/
+E_downstream/
+esm_pdb_complete/
+fasta/
+figure_output/
+other/
+pdb/
+saturation_mutagenesis/
+stage1_dataset_nb/
+stage1-2_dataset_utils/
+stage2_dataset_nb/
+stage2data_sample/
+tb_logs/
+temp_inference_results/
+
+# --- Specific Files  ---
+*.ipynb
