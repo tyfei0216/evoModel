@@ -5,10 +5,9 @@ import pytorch_lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torchmetrics
 from attr import dataclass
 
-import torchmetrics 
 
 @dataclass
 class VESMOutputs:
@@ -38,16 +37,16 @@ class VESMConfig:
     esm_model_type: str
     esm_model_channels: int
     out_channels: int = 512
-    track:list[str] = None
+    track: list[str] = None
 
     # aa wise predicts
     aa_counts: int = 33
     aa_predict_classes: int = 3
 
-    # xiugai 
+    # xiugai
     regressor_version: str = "legacy"  # 默认为"legacy"（旧版）
     dropout_rate: float = 0.2
-    
+
     # protein wise predicts
     stage1_predict_classes: int = 0
 
@@ -97,6 +96,7 @@ class SelfAttention(nn.Module):
         self.n_head = n_head
         assert channels % n_head == 0
         import torchtune
+
         self.rope = torchtune.modules.RotaryPositionalEmbeddings(channels // n_head)
         self.mha = nn.MultiheadAttention(channels, n_head, batch_first=True)
         self.ln = nn.LayerNorm([channels])
@@ -293,7 +293,7 @@ class Regressors(nn.Module):
             self.dropout = nn.Dropout(p=0.2)
         else:
             self.dropout = None
-        
+
         # self.clf = nn.Sequential(
         #     nn.Linear(out_channels, hidden_dim),
         #     nn.GELU(),
@@ -314,22 +314,22 @@ class Regressors(nn.Module):
         #     nn.LayerNorm(hidden_dim),
         #     nn.Linear(hidden_dim, 1),
         # )
-        
+
         self.clf = nn.Sequential(
-           nn.Linear(out_channels, hidden_dim),
-           nn.GELU(),
-           nn.LayerNorm(hidden_dim),
-           nn.Linear(hidden_dim, predict_classes),
+            nn.Linear(out_channels, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, predict_classes),
         )
         # CovidFit
         # self.clf = nn.Sequential(
         #     nn.Linear(out_channels, hidden_dim),
-        #     nn.ReLU(), 
+        #     nn.ReLU(),
         #     nn.Linear(hidden_dim, hidden_dim),
-        #     nn.ReLU(), 
+        #     nn.ReLU(),
         #     nn.Linear(hidden_dim, predict_classes),
         #     )
-        
+
         self.time_series = nn.Sequential(
             nn.Linear(out_channels, hidden_dim),
             nn.GELU(),
@@ -341,6 +341,7 @@ class Regressors(nn.Module):
         if self.dropout is not None:
             x = self.dropout(x)
         return {"predictions": self.clf(x), "time_series": self.time_series(x)}
+
 
 class RegressorsMCDropout(nn.Module):
     def __init__(self, out_channels, hidden_dim, predict_classes, dropout_rate=0.2):
@@ -365,8 +366,6 @@ class RegressorsMCDropout(nn.Module):
 
     def forward(self, x):
         return {"predictions": self.clf(x), "time_series": self.time_series(x)}
-
-
 
 
 class VESM(L.LightningModule):
@@ -406,21 +405,20 @@ class VESM(L.LightningModule):
 
         self.stage_1_embed = nn.Embedding(config.aa_counts, config.out_channels)
 
-
         if config.regressor_version == "mc_dropout":
             print("INFO: Using Regressors with MC Dropout for new model.")
             self.stage_1_regressors = RegressorsMCDropout(
                 config.out_channels,
                 config.stage_1_clf_hidden_dim,
                 config.stage1_predict_classes,
-                dropout_rate=config.dropout_rate
+                dropout_rate=config.dropout_rate,
             )
             # 同样为stage 2也进行替换
             self.stage_2_regressors = RegressorsMCDropout(
                 config.out_channels,
                 config.stage_2_clf_hidden_dim,
                 config.stage2_predict_classes,
-                dropout_rate=config.dropout_rate
+                dropout_rate=config.dropout_rate,
             )
         else:
             # 如果config中没有指定版本，或指定为legacy，则使用原始类
@@ -436,7 +434,6 @@ class VESM(L.LightningModule):
                 config.stage2_predict_classes,
             )
 
-
         # self.stage_1_regressors = Regressors(
         #     config.out_channels,
         #     config.stage_1_clf_hidden_dim,
@@ -450,7 +447,7 @@ class VESM(L.LightningModule):
                 for i in range(config.stage_2_transformer_layers)
             ]
         )
-        
+
         # self.stage_2_encoder_blocks = nn.TransformerEncoder(
         #     nn.TransformerEncoderLayer(
         #         d_model=config.out_channels,
@@ -468,7 +465,7 @@ class VESM(L.LightningModule):
                 for i in range(config.stage_2_transformer_layers)
             ]
         )
-        
+
         # self.stage_2_decoder_blocks = nn.TransformerEncoder(
         #     nn.TransformerEncoderLayer(
         #         d_model=config.out_channels,
@@ -489,14 +486,15 @@ class VESM(L.LightningModule):
         # training utils
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
+        self.kl = nn.KLDivLoss(reduction="none")
         self.cross_entropy = nn.CrossEntropyLoss(reduction="none")
         self.cross_entropy_mutation = nn.CrossEntropyLoss(
             weight=torch.tensor([0.1, 1.0, 1.0])
         )
         self.training_step_outputs = []
         self.validation_step_outputs = []
-        self.last_train_step = 0 
-        
+        self.last_train_step = 0
+
         self.pearson = torchmetrics.PearsonCorrCoef()
 
     # deprecated
@@ -542,7 +540,6 @@ class VESM(L.LightningModule):
 
         return stage_1_embeds, stage_1_logits, stage_1_predicts, stage_1_aa_clf
 
-
     def stage1_forward(self, input_dict, masks=None):
         stage_1_embeds = {}
         stage_1_logits = {}
@@ -551,7 +548,7 @@ class VESM(L.LightningModule):
         for i in input_dict:
             if i not in self.prots:
                 continue
-                
+
             x = self.esm_model(input_dict[i])
             embed = self.stage_1_bottleneck(x)
             batchsize, length, channels = embed.shape
@@ -585,9 +582,9 @@ class VESM(L.LightningModule):
                     if seq_tensor.dim() == 1:
                         # unsqueeze and repeat to match batch size
                         seq_tensor = seq_tensor.unsqueeze(0).repeat(batchsize, 1)
-                    
+
                     seq_embedded = self.stage_1_embed(seq_tensor)
-                    
+
                     # 确保维度匹配后相加
                     if seq_embedded.shape == x_recon.shape:
                         x_recon += seq_embedded
@@ -597,9 +594,6 @@ class VESM(L.LightningModule):
             stage_1_aa_clf[i] = x_output["predict_logits"]
 
         return stage_1_embeds, stage_1_logits, stage_1_predicts, stage_1_aa_clf
-
-
-
 
     def stage2_forward(self, stage_1_embeds, masks=None):
         if masks is None:
@@ -646,7 +640,12 @@ class VESM(L.LightningModule):
         return stage_2_embeddings, stage_2_reconstruct, stage_2_predicts
 
     def forward(
-        self, input_dict=None, stage_1_masks=None, stage_2_masks=None, only_stage_1=False,  stage_1_embeds=None
+        self,
+        input_dict=None,
+        stage_1_masks=None,
+        stage_2_masks=None,
+        only_stage_1=False,
+        stage_1_embeds=None,
     ):
         # if stage_1_embeds is None:
         if "stage 1" in self.stage:
@@ -673,7 +672,6 @@ class VESM(L.LightningModule):
                     )
         # else: # 如果 stage_1_embeds 不为 None, 则 stage_1_logits 等为 None
         #     stage_1_logits, stage_1_predicts, stage_1_aa_clf = None, None, None
-
 
         if only_stage_1:
             return VESMOutputs(
@@ -723,7 +721,7 @@ class VESM(L.LightningModule):
 
     def stage1_prediction_loss(self, output: VESMOutputs, input_dict):
         prediction_losses = {}
-        
+
         if "label" not in input_dict or self.config.stage1_predict_classes == 0:
             return prediction_losses
 
@@ -737,7 +735,7 @@ class VESM(L.LightningModule):
             predicted_vector = output.S1Predicts[protein_name]["predictions"][0]
             true_vector = torch.cat(list(input_dict["label"].values()))
             true_vector = true_vector.to(dtype=predicted_vector.dtype)
-            
+
             if true_vector.shape != predicted_vector.shape:
                 raise RuntimeError(
                     f"无法匹配蛋白质'{protein_name}'的标签和预测形状。"
@@ -748,7 +746,7 @@ class VESM(L.LightningModule):
             # print(true_vector)
             # loss = self.mse(predicted_vector, torch.zeros_like(predicted_vector))
             prediction_losses[protein_name] = loss
-            
+
         # print(prediction_losses)
 
         return prediction_losses
@@ -772,11 +770,15 @@ class VESM(L.LightningModule):
                 # 提取真实值和预测值
                 true_score = input_dict["label"]["fitness_score"].float()
                 predicted_score = output.S1Predicts[i]["predictions"]
-                
+
                 # 假设 true_score 是一个标量或只有一个元素的张量
                 if not isinstance(true_score, torch.Tensor):
-                    true_score = torch.tensor(true_score, device=predicted_score.device, dtype=predicted_score.dtype)
-                
+                    true_score = torch.tensor(
+                        true_score,
+                        device=predicted_score.device,
+                        dtype=predicted_score.dtype,
+                    )
+
                 # 确保 true_score 和 predicted_score 形状可以计算MSE
                 if true_score.dim() == 0:
                     true_score = true_score.unsqueeze(0)
@@ -794,8 +796,7 @@ class VESM(L.LightningModule):
         stage_1_prediction_loss = {}
         if "label" not in input_dict or self.config.stage1_predict_classes == 0:
             return stage_1_prediction_loss
-        
-        
+
         # xiugai
         # input_dict you labels, cong zhong du qu gai zhi,
         # output zhong you S1Predicts 中有predictions中有预测的值， 两者算一个mse返回
@@ -822,9 +823,15 @@ class VESM(L.LightningModule):
             return stage_1_logitLosses
         for i in output.S1Logits:
             s1 = output.S1Logits[i]
-            s1 = s1.view(-1, s1.shape[-1])
-            l1 = input_dict["ori_seq"][i]["seq_t"].flatten()
-            loss = self.cross_entropy(s1, l1)
+            if "ori_seq_kl" in input_dict:
+                # use soft labels
+                s1 = s1.log_softmax(dim=-1)
+                l1 = input_dict["ori_seq_kl"][i]
+                loss = self.kl(s1, l1).sum(-1)
+            else:
+                s1 = s1.view(-1, s1.shape[-1])
+                l1 = input_dict["ori_seq"][i]["seq_t"].flatten()
+                loss = self.cross_entropy(s1, l1)
             if (
                 "stage_1_masks" in input_dict
                 and input_dict["stage_1_masks"] is not None
@@ -844,8 +851,8 @@ class VESM(L.LightningModule):
         stage_1_logitLosses = {}
         if "ori_seq" not in input_dict:
             return stage_1_logitLosses
-        
-        for i in output.S1Logits: # i 是蛋白质名称，如 'S'
+
+        for i in output.S1Logits:  # i 是蛋白质名称，如 'S'
             s1 = output.S1Logits[i]
             s1 = s1.view(-1, s1.shape[-1])
 
@@ -868,19 +875,16 @@ class VESM(L.LightningModule):
                 mask += self.config.stage_1_masked_weight
             else:
                 mask = torch.ones_like(loss)
-                
+
             loss = loss * mask
             # 避免除以零的错误
             if mask.sum() > 0:
                 loss = loss.sum() / mask.sum()
             else:
-                loss = loss.sum() # 如果没有可计算损失的token，则不进行平均
+                loss = loss.sum()  # 如果没有可计算损失的token，则不进行平均
             stage_1_logitLosses[i] = loss
-            
+
         return stage_1_logitLosses
-
-
-
 
     def stage1_aa_prediction_loss(self, output: VESMOutputs, input_dict):
         stage_1_aa_logitLosses = {}
@@ -916,14 +920,14 @@ class VESM(L.LightningModule):
 
     def stage2_prediction_loss(self, output: VESMOutputs, input_dict):
         prediction_losses = None
-        
+
         if "label" not in input_dict or "predictions" not in output.S2Predicts:
             return prediction_losses
 
         predicted_vector = output.S2Predicts["predictions"][0]
         true_vector = torch.cat(list(input_dict["label"].values()))
         true_vector = true_vector.to(dtype=predicted_vector.dtype)
-        
+
         if true_vector.shape != predicted_vector.shape:
             raise RuntimeError(
                 f"无法匹配stage2嵌入的标签和预测形状。"
@@ -942,7 +946,9 @@ class VESM(L.LightningModule):
         if t.dim() == 1:
             t = t.unsqueeze(0)
         if self.config.stage_2_predictLosses is not None:
-            loss = self.config.stage_2_predictLosses(output.S2Predicts["predictions"], t)
+            loss = self.config.stage_2_predictLosses(
+                output.S2Predicts["predictions"], t
+            )
         else:
             loss = self.bce(
                 output.S2Predicts["predictions"],
@@ -951,9 +957,9 @@ class VESM(L.LightningModule):
         return loss
 
     def getLoss(self, input_dict1, input_dict2=None):
-        
+
         if "from embedding" in self.stage:
-             output1 = self.forward(
+            output1 = self.forward(
                 stage_1_embeds=input_dict1["input"],
                 stage_2_masks=input_dict1.get("stage_2_masks", None),
             )
@@ -978,7 +984,7 @@ class VESM(L.LightningModule):
                 )
         else:
             output2 = None
-            
+
         # print(input_dict1)
         # output1 = self.forward(
         #     input_dict1["input"],
@@ -994,13 +1000,11 @@ class VESM(L.LightningModule):
         # else:
         #     output2 = None
 
-
-        
         # stage 1 losses
         stage_1_logitLosses = {}
         stage_1_predictLosses = {}
         stage_1_predictAALosses = {}
-        
+
         # 不从emb训练才执行stage1 loss
         # if "stage_1_embeds" not in input_dict1:
         if "from embedding" not in self.stage:
@@ -1020,8 +1024,8 @@ class VESM(L.LightningModule):
                 for i in s:
                     stage_1_logitLosses[i + "_2"] = s[i]
 
-            #xiugai 
-            # zeng jia liang ge mse loss shang qu 
+            # xiugai
+            # zeng jia liang ge mse loss shang qu
             if "label" in input_dict1:
                 stage_1_predict_loss = self.stage1_prediction_loss(output1, input_dict1)
             else:
@@ -1032,7 +1036,9 @@ class VESM(L.LightningModule):
 
             if output2 is not None:
                 if "label" in input_dict2:
-                    stage_1_predict_loss = self.stage1_prediction_loss(output2, input_dict2)
+                    stage_1_predict_loss = self.stage1_prediction_loss(
+                        output2, input_dict2
+                    )
                 else:
                     stage_1_predict_loss = {}
                 for i in stage_1_predict_loss:
@@ -1042,7 +1048,6 @@ class VESM(L.LightningModule):
                 s = self.stage1_time_series_loss(output1, output2)
                 for i in s:
                     stage_1_predictLosses[i + "_time_series"] = s[i]
-
 
         # print("stage_1_predictLosses:",stage_1_predictLosses)
 
@@ -1090,20 +1095,22 @@ class VESM(L.LightningModule):
             )
         # else:
         #     stage_2_predictLosses = None
-            
+
         # 新增stage2 predictions
         if "label" in input_dict1:
-            stage_2_predictLosses["predicted_1"] = self.stage2_prediction_loss(output1, input_dict1)
+            stage_2_predictLosses["predicted_1"] = self.stage2_prediction_loss(
+                output1, input_dict1
+            )
         else:
             stage_2_predictLosses["predicted_1"] = {}
 
-
         if output2 is not None:
             if "label" in input_dict2:
-                stage_2_predictLosses["predicted_2"] = self.stage2_prediction_loss(output2, input_dict2)
+                stage_2_predictLosses["predicted_2"] = self.stage2_prediction_loss(
+                    output2, input_dict2
+                )
             else:
                 stage_2_predictLosses["predicted_2"] = {}
-            
 
         return VESMLosses(
             S1PredictsLosses=stage_1_predictLosses,
@@ -1135,14 +1142,14 @@ class VESM(L.LightningModule):
         if self.stage == "training stage 2":
             # 如果是从 embedding 开始训练， S1 部分的 loss 就是0
             # # if "stage_1_embeds" in input_dict1:
-            
+
             #     loss1 = sum([i for i in loss.S2ReconstructLosses.values()])
             #     predict_loss_val = loss.S2PredictsLoss
             #     if isinstance(predict_loss_val, dict):
             #         loss3 = sum(predict_loss_val.values())
             #     else:
             #         loss3 = predict_loss_val if predict_loss_val is not None else 0.0
-                
+
             #     loss_val = (
             #         loss1 * self.config.stage_2_recosntruct_weight
             #         + loss3 * self.config.stage_2_regressor_weight
@@ -1152,13 +1159,13 @@ class VESM(L.LightningModule):
             #         "S2PredictsLoss": loss3.detach().cpu() if torch.is_tensor(loss3) else torch.tensor(loss3),
             #         "loss": loss_val.detach().cpu(),
             #     }
-            #     return loss_val, d          
+            #     return loss_val, d
             # else:
             loss1 = sum([i for i in loss.S2ReconstructLosses.values()])
-            
+
             # loss3 = loss.S2PredictsLoss
             predict_loss_val = loss.S2PredictsLoss
-            
+
             # 检查 S2PredictsLoss 是否是字典
             if isinstance(predict_loss_val, dict):
                 loss3 = sum(predict_loss_val.values())
@@ -1175,24 +1182,28 @@ class VESM(L.LightningModule):
                 "loss": loss.detach().cpu(),
             }
             return loss, d
-        
+
         if self.stage == "training stage 2 from embedding":
             # 如果是从 embedding 开始训练， S1 部分的 loss 就是0
-            
+
             loss1 = sum([i for i in loss.S2ReconstructLosses.values()])
             predict_loss_val = loss.S2PredictsLoss
             if isinstance(predict_loss_val, dict):
                 loss3 = sum(predict_loss_val.values())
             else:
                 loss3 = predict_loss_val if predict_loss_val is not None else 0.0
-            
+
             loss_val = (
                 loss1 * self.config.stage_2_recosntruct_weight
                 + loss3 * self.config.stage_2_regressor_weight
             )
             d = {
                 "S2ReconstructLosses": loss1.detach().cpu(),
-                "S2PredictsLoss": loss3.detach().cpu() if torch.is_tensor(loss3) else torch.tensor(loss3),
+                "S2PredictsLoss": (
+                    loss3.detach().cpu()
+                    if torch.is_tensor(loss3)
+                    else torch.tensor(loss3)
+                ),
                 "loss": loss_val.detach().cpu(),
             }
             return loss_val, d
@@ -1268,38 +1279,40 @@ class VESM(L.LightningModule):
                     )
             else:
                 output2 = None
-        
+
         dp = {}
-        
+
         if input_dict1["label"]:
- 
+
             dp["label_key"] = list(input_dict1["label"].keys())
             dp["output1_x"] = {}
             true_vector = torch.cat(list(input_dict1["label"].values()))
             for protein_name in output1.S1Predicts:
-                predicted_vector = output1.S1Predicts[protein_name]["predictions"][0].detach()
-                dp["output1_x"][protein_name] = predicted_vector 
-            dp["output1_y"] = true_vector    
+                predicted_vector = output1.S1Predicts[protein_name]["predictions"][
+                    0
+                ].detach()
+                dp["output1_x"][protein_name] = predicted_vector
+            dp["output1_y"] = true_vector
             if output2 is not None:
                 dp["output2_x"] = {}
                 true_vector = torch.cat(list(input_dict2["label"].values()))
                 for protein_name in output2.S1Predicts:
-                    predicted_vector = output2.S1Predicts[protein_name]["predictions"][0].detach()
+                    predicted_vector = output2.S1Predicts[protein_name]["predictions"][
+                        0
+                    ].detach()
                     dp["output2_x"][protein_name] = predicted_vector
                 dp["output2_y"] = true_vector
             else:
-                dp["output2_x"] = None 
-                dp["output2_y"] = None 
-        
+                dp["output2_x"] = None
+                dp["output2_y"] = None
+
         loss, d = self._common_training_step(input_dict1, input_dict2)
-        
-        
+
         for i in d:
-            dp["validation_" + i] = d[i] 
-            
+            dp["validation_" + i] = d[i]
+
         self.validation_step_outputs.append(dp)
 
-        
         return loss
 
     def _common_epoch_end(self, outputs):
@@ -1338,34 +1351,33 @@ class VESM(L.LightningModule):
                 t = i.pop("output1_y")
                 y.append(t)
                 key = i.pop("label_key")
-            
-        
+
             x = torch.stack(x)
             y = torch.stack(y)
-            
+
             # print("key:",key)
-            print("x:",x)
+            print("x:", x)
             # print("y:",y)
             p_sum = 0
             for i in range(len(key)):
-                p = self.pearson(x[:,i], y[:,i])
+                p = self.pearson(x[:, i], y[:, i])
                 self.pearson.reset()
                 p_sum += p
                 self.log(f"validation_pearson_{key[i]}", p)
-                
+
             # self.pearson.reset()
             self.log(f"validation_pearson", p_sum)
-            
+
             # p = self.pearson(x[:, 1], y[:, 1])
-            # self.pearson.reset() 
+            # self.pearson.reset()
             # self.log("validation_pearson_1", p)
-            
+
             # p = self.pearson(x[:, 2], y[:, 0])
-            # self.pearson.reset() 
+            # self.pearson.reset()
             # self.log("validation_pearson_0", p)
-        
+
         res = self._common_epoch_end(self.validation_step_outputs)
-        
+
         print("finish validating epoch with loss:")
         print(res)
         for i in res:
@@ -1387,18 +1399,18 @@ class VESM(L.LightningModule):
         self.last_train_step = len(self.training_step_outputs)
 
     def configure_optimizers(self):
-        
+
         if "finetune" in self.stage:
             for i, j in self.named_parameters():
                 freeze = True
                 if "1" in self.stage:
                     if "1_regressors" in i:
-                        freeze = False 
+                        freeze = False
                 if "2" in self.stage:
                     if "2_regressors" in i:
                         freeze = False
                 if freeze:
-                    j.requires_grad_(False)   
+                    j.requires_grad_(False)
         if self.config.lr_backbone is not None:
             l1 = []
             l2 = []
@@ -1428,7 +1440,7 @@ class VESM(L.LightningModule):
     #             backbones.append(i)
     #     for i in backbones:
     #         del checkpoint["state_dict"][i]
-    
+
     def on_save_checkpoint(self, checkpoint):
         backbones = []
         for i, j in self.named_parameters():
@@ -1437,14 +1449,12 @@ class VESM(L.LightningModule):
         for i in backbones:
             del checkpoint["state_dict"][i]
 
-
     # 添加一个方法来激活 MC Dropout
     def enable_mc_dropout(self):
         """在所有模块中激活 Dropout 层"""
         for module in self.modules():
             if isinstance(module, nn.Dropout):
-                module.train() # 将 Dropout 层设置为训练模式
-                
+                module.train()  # 将 Dropout 层设置为训练模式
 
     def predict_step(self, input_dict):
         if "input" in input_dict:
@@ -1458,6 +1468,7 @@ class VESM(L.LightningModule):
         else:
             output1 = self.forward(input_dict)
             return output1
+
 
 class MyESM(nn.Module):
     """A lightweight Transformer encoder with rotary positional embeddings.
@@ -1521,7 +1532,8 @@ class MyESM(nn.Module):
 
         x = self.final_ln(x)
         return x
-        
+
+
 class MyESM_shabi(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1602,31 +1614,31 @@ class SimpleESM(L.LightningModule):
             nn.GELU(),
             nn.Linear(config.esm_model_channels // 2, config.aa_counts),
         )
-        
+
         # self.stage_1_regressors = Regressors(
         #        config.esm_model_channels,
         #        # 1275,
         #        config.stage_1_clf_hidden_dim,
         #        config.stage1_predict_classes,
-        #    )  
+        #    )
         self.regressor = nn.Sequential(
-                nn.Linear(config.esm_model_channels, 512), 
-                nn.Dropout(0.2),
-                nn.ReLU(), 
-                nn.Linear(512, 512), 
-                nn.ReLU(),
-                nn.Linear(512, 1) 
+            nn.Linear(config.esm_model_channels, 512),
+            nn.Dropout(0.2),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
         )
-        
+
         self.aa_predict = nn.Sequential(
-                nn.Linear(config.esm_model_channels, 512), 
-                nn.Dropout(0.2),
-                nn.ReLU(), 
-                nn.Linear(512, 512), 
-                nn.ReLU(),
-                nn.Linear(512, 1) 
+            nn.Linear(config.esm_model_channels, 512),
+            nn.Dropout(0.2),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
         )
-        
+
         self.return_classifier_results = config.stage1_predict_classes > 0
 
         self.cross_entropy = nn.CrossEntropyLoss(reduce="None")
@@ -1639,57 +1651,57 @@ class SimpleESM(L.LightningModule):
         self.pearson = torchmetrics.PearsonCorrCoef()
         self.cnts = 0
 
-    def forward(self, input_dict, position = None, thres=1.0):
+    def forward(self, input_dict, position=None, thres=1.0):
         embeds = {}
         logits = {}
         stage_1_predicts = {}
         for i in input_dict:
             if i not in self.prots:
                 continue
-            #print(input_dict[i])
+            # print(input_dict[i])
             x = self.esm_model(input_dict[i])
             embeds[i] = x
-            logits[i] = self.aa_clf(x) 
+            logits[i] = self.aa_clf(x)
             if self.return_classifier_results:
                 # print(input_dict)
-                aa_logit = self.aa_predict(x) 
+                aa_logit = self.aa_predict(x)
                 aa_logit = aa_logit.squeeze(-1)
                 weight = torch.softmax(aa_logit, 1)
                 if position is None:
                     predicts = self.regressor(x[:, 0, :])
                 else:
-                    pooled = torch.einsum("blc,bl->bc", x, weight.detach()) 
+                    pooled = torch.einsum("blc,bl->bc", x, weight.detach())
                     predicts = self.regressor(pooled)
                     # if torch.rand(1) > thres:
                     #     predicts = self.regressor(x[:, position, :])
                     # else:
                     #     predicts = self.regressor(x[:, 0, :])
                 stage_1_predicts[i] = predicts
-            
+
         if self.return_classifier_results:
-        #    stage_1_predicts = {}
-        #    for i in input_dict:
-        #        if i not in self.prots:
-        #            continue
-        #        embed = embeds[i] 
-        #       embed = torch.mean(embed, axis=1) 
-        #       predicts = self.stage_1_regressors(embed)
-        #        stage_1_predicts[i] = predicts 
+            #    stage_1_predicts = {}
+            #    for i in input_dict:
+            #        if i not in self.prots:
+            #            continue
+            #        embed = embeds[i]
+            #       embed = torch.mean(embed, axis=1)
+            #       predicts = self.stage_1_regressors(embed)
+            #        stage_1_predicts[i] = predicts
             return embeds, logits, stage_1_predicts, aa_logit
-               
+
         return embeds, logits
 
     def _common_training_step(self, batch, outputs=None, thres=1.0):
         # print(batch)
-        
+
         if self.return_classifier_results:
-            position = [int(i[1:-1]) for i in batch["meta"]["id"]] 
+            position = [int(i[1:-1]) for i in batch["meta"]["id"]]
             position = torch.tensor(position).to(self.device) - 1
             position.requires_grad_(False)
             # print(batch["meta"], position)
             # position = None
             output = self.forward(batch["input"], position=position, thres=thres)
-            embeds, logits, stage_1_predicts, aa_logit = output 
+            embeds, logits, stage_1_predicts, aa_logit = output
         else:
             output = self.forward(batch["input"])
             embeds, logits = output
@@ -1697,13 +1709,13 @@ class SimpleESM(L.LightningModule):
         for i in logits:
             s1 = logits[i]
             s1 = s1.view(-1, s1.shape[-1])
-            
+
             if isinstance(batch["ori_seq"][i], dict):
                 # 如果是字典，则提取 'seq_t'
                 ori_seq = batch["ori_seq"][i]["seq_t"]
             else:
                 ori_seq = batch["ori_seq"][i]
-            
+
             l1 = ori_seq.flatten()
             loss = self.cross_entropy(s1, l1)
             if "stage_1_masks" in batch and batch["stage_1_masks"] is not None:
@@ -1722,20 +1734,25 @@ class SimpleESM(L.LightningModule):
             mse_loss = 0
             bce_loss = 0
             for i in logits:
-                predicted_vector = stage_1_predicts[i][0] 
+                predicted_vector = stage_1_predicts[i][0]
                 gth = torch.zeros_like(aa_logit)
                 gth[:, position] = 1.0
                 true_vector = torch.cat(list(batch["label"].values()))
                 true_vector = true_vector.to(dtype=predicted_vector.dtype)
                 if outputs is not None:
-                    outputs.append({"true_vector":true_vector.detach(), "predicted_vector":predicted_vector.detach()})
+                    outputs.append(
+                        {
+                            "true_vector": true_vector.detach(),
+                            "predicted_vector": predicted_vector.detach(),
+                        }
+                    )
                 loss = self.mse(predicted_vector, true_vector)
                 mse_loss += loss
                 bce_loss += self.bce(aa_logit, gth)
             # print("mse_loss", mse_loss)
             self.log("MSE_loss", mse_loss)
             self.log("BCE_loss", bce_loss)
-            return mse_loss*0.5 + bce_loss, embeds
+            return mse_loss * 0.5 + bce_loss, embeds
             total_loss += mse_loss
         return total_loss, embeds
 
@@ -1743,23 +1760,25 @@ class SimpleESM(L.LightningModule):
         loss, d = self._common_training_step(batch, None, thres=-0.5)
         self.log("training_loss", loss.detach().cpu(), prog_bar=True)
         return loss
-    
+
     def on_validation_epoch_end(self):
         if len(self.validation_step_outputs) > 0:
-            x = [i["predicted_vector"] for i in self.validation_step_outputs] 
-            y = [i["true_vector"] for i in self.validation_step_outputs] 
-            x = torch.stack(x).squeeze() 
+            x = [i["predicted_vector"] for i in self.validation_step_outputs]
+            y = [i["true_vector"] for i in self.validation_step_outputs]
+            x = torch.stack(x).squeeze()
             y = torch.stack(y).squeeze()
-            # self.cnts += 1 
+            # self.cnts += 1
             # if self.cnts % 200 == 0:
-            print(x) 
-            p = self.pearson(x, y) 
+            print(x)
+            p = self.pearson(x, y)
             self.pearson.reset()
             self.log("validation_pearson", p)
             self.validation_step_outputs.clear()
 
     def validation_step(self, batch, batch_idx):
-        loss, d = self._common_training_step(batch, self.validation_step_outputs, thres=-1.0)
+        loss, d = self._common_training_step(
+            batch, self.validation_step_outputs, thres=-1.0
+        )
         self.log("validation_loss", loss.detach().cpu(), prog_bar=True)
         return loss
 
@@ -1790,7 +1809,7 @@ class SimpleESM(L.LightningModule):
                 filter(lambda p: p.requires_grad, self.parameters()),
                 self.config.lr,
             )
-            
+
     # def on_save_checkpoint(self, checkpoint):
     #     backbones = []
     #     for i in checkpoint["state_dict"]:
@@ -1807,6 +1826,7 @@ class SimpleESM(L.LightningModule):
         for i in backbones:
             del checkpoint["state_dict"][i]
 
+
 class ESMModule(nn.Module):
     def __init__(self, esm_model, esm_model_type, track=None):
         super().__init__()
@@ -1821,11 +1841,10 @@ class ESMModule(nn.Module):
 
     def forward(self, input_dict):
         if self.esm_model_type == "esm3":
-            
-            
+
             for i in ["seq_t", "structure_t", "ss8_t", "sasa_t"]:
                 if i not in input_dict:
-                    input_dict[i] = None 
+                    input_dict[i] = None
                 elif i not in self.track:
                     input_dict[i] = None
                 else:
@@ -1859,7 +1878,7 @@ class ESMModule(nn.Module):
         if self.esm_model_type == "esm2":
             # assert "seq_t" in input_dict
             # t = input_dict["seq_t"]
-            
+
             t = input_dict
             # print(input_dict)
             if len(t.size()) == 1:
@@ -1881,11 +1900,11 @@ class ESMModule(nn.Module):
             )
 
             x = representations.embeddings
-            return x 
-        
+            return x
+
         if self.esm_model_type == "dummy":
             t = input_dict
-            
+
             if len(t.size()) == 1:
                 t = t.unsqueeze(0)
 
@@ -1894,7 +1913,7 @@ class ESMModule(nn.Module):
             )
 
             x = representations
-            return x 
+            return x
 
         raise NotImplementedError
 

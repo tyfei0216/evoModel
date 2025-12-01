@@ -5,10 +5,11 @@ import random
 import numpy as np
 import pytorch_lightning as L
 import torch
-import C
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import SubsetRandomSampler
+
+import C
 
 SEQ_VOCAB = [
     "A",
@@ -452,19 +453,19 @@ class VESMDataset(BaseDataset):
         return mask, pos
 
     def getToken(self, token, track="seq_t"):
-            # assert token in ["start", "end", "mask"]
-            assert track == "seq_t"
-            match token:
-                case "start":
-                    return 0
-                case "end":
-                    return 2
-                case "mask":
-                    return 32
-                case "pad":
-                    return 1
-                case _:
-                    raise ValueError
+        # assert token in ["start", "end", "mask"]
+        assert track == "seq_t"
+        match token:
+            case "start":
+                return 0
+            case "end":
+                return 2
+            case "mask":
+                return 32
+            case "pad":
+                return 1
+            case _:
+                raise ValueError
 
     # def getToken(self, token, track="seq_t"):
     #     # assert token in ["start", "end", "mask"]
@@ -562,7 +563,7 @@ class VESMDataset(BaseDataset):
         #         if i in data:
         #             sample["meta"][i] = data[i]
         #     return sample
-        
+
         sample = {}
         sample["input"] = {}
         sample["aligned"] = {}
@@ -581,9 +582,9 @@ class VESMDataset(BaseDataset):
                     #     d1 = d1[: len(d2)]
                     sample["input"][i] = d1
                     sample["aligned"][i] = d2
-            
+
             # print(sample["input"])
-            
+
         else:
             q = self.seq[input_idx % len(self.seq)]
             d1 = data[q]
@@ -594,8 +595,18 @@ class VESMDataset(BaseDataset):
             #     d1 = d1[: len(d2)]
             sample["input"][q] = d1
             sample["aligned"][q] = d2
-            
-        for i in ["id", "bin", "days", "fitness_score", "death_rate", "expression", 'Expression', 'CCK8', 'Activation']:
+
+        for i in [
+            "id",
+            "bin",
+            "days",
+            "fitness_score",
+            "death_rate",
+            "expression",
+            "Expression",
+            "CCK8",
+            "Activation",
+        ]:
             if i in data:
                 sample["meta"][i] = data[i]
         return sample
@@ -612,7 +623,9 @@ class VESMDataset(BaseDataset):
                     # )
                     # 新增随机采样 + self.pnts[i]
                     sample = self.data[i][
-                        self.data_order[i][(idx + self.pnts[i]) % len(self.data_order[i])]
+                        self.data_order[i][
+                            (idx + self.pnts[i]) % len(self.data_order[i])
+                        ]
                     ]
                     sample = self.getSample(sample, ori_idx)
                     if self.train_time_series:
@@ -633,7 +646,7 @@ class VESMDataset(BaseDataset):
                 if idx - len(i) < 0:
                     # print(idx)
                     # print(i[0]["id"])
-                    
+
                     sample = i[idx]
                     sample = self.getSample(sample, ori_idx)
                     if self.train_time_series:
@@ -653,6 +666,7 @@ class VESMDataset(BaseDataset):
         x1 = {}
         x1["input"] = {}
         x1["ori_seq"] = {}
+        x1["ori_seq_kl"] = {}
 
         if "stage 1" in self.stage:
             x1["stage_1_masks"] = {}
@@ -674,12 +688,11 @@ class VESMDataset(BaseDataset):
                 final_aligned_dict["seq_t"] = ret["aligned"]
                 x1["input"]["aligned_" + i] = final_aligned_dict
 
-
                 # x1["ori_seq"][i] = ret["ori_seq"] 需不需要改？
                 final_ori_seq_dict = t["input"][i].copy()
                 final_ori_seq_dict["seq_t"] = ret["ori_seq"]
                 x1["ori_seq"][i] = final_ori_seq_dict
-
+                # x1["ori_seq_kl"][i] = t
 
                 x1["stage_1_masks"][i] = ret["mask"]
                 # print(ret)
@@ -706,7 +719,6 @@ class VESMDataset(BaseDataset):
         x1["meta"] = t["meta"]
         return x1
 
-
     def processSample(self, t):
         # 新增stage2从emb数据集开始训练
         # if self.train_from_emb:
@@ -726,16 +738,17 @@ class VESMDataset(BaseDataset):
         #         if i in t["meta"]:
         #             x1["label"][i] = t["meta"][i]
         #     return x1
-        
+
         x1 = {}
         x1["input"] = {}
         x1["ori_seq"] = {}
         x1["label"] = {}
+        x1["ori_seq_kl"] = {}
 
         if "stage 1" in self.stage:
             x1["stage_1_masks"] = {}
             x1["mutation_label"] = {}
-            
+
             for i in t["input"]:
                 input_data = t["input"][i]
                 aligned_data = t["aligned"][i]
@@ -764,11 +777,13 @@ class VESMDataset(BaseDataset):
                     final_ori_seq_dict = input_data.copy()
                     final_ori_seq_dict["seq_t"] = ret["ori_seq"]
                     x1["ori_seq"][i] = final_ori_seq_dict
+                    x1["ori_seq_kl"][i] = t["ori_seq_kl"][i]
                 else:
                     x1["input"][i] = ret["sample"]
                     x1["input"]["aligned_" + i] = ret["aligned"]
                     x1["ori_seq"][i] = ret["ori_seq"]
-                
+                    x1["ori_seq_kl"][i] = t["ori_seq_kl"][i]
+
                 x1["stage_1_masks"][i] = ret["mask"]
                 x1["mutation_label"][i] = ret["mutation_label"]
                 # x1["label"][i] = self.prepareLabels(t)
@@ -783,22 +798,28 @@ class VESMDataset(BaseDataset):
                 seq = t["input"][i]
                 x1["input"][i] = seq
                 x1["ori_seq"][i] = seq
-                
+
         if "stage 2" in self.stage:
             x1["stage_2_masks"] = []
             for i in self.seq:
                 r = np.random.uniform(0.001, 0.999)
                 if r < self.stage_2_maskp:
                     x1["stage_2_masks"].append(i)
-                    
-        for i in ["fitness_score", "death_rate", "expression", 'Expression', 'CCK8', 'Activation']:
-        # for i in ["fitness_score", "death_rate", "expression", 'CCK8']:
+
+        for i in [
+            "fitness_score",
+            "death_rate",
+            "expression",
+            "Expression",
+            "CCK8",
+            "Activation",
+        ]:
+            # for i in ["fitness_score", "death_rate", "expression", 'CCK8']:
             if i in t["meta"]:
                 x1["label"][i] = t["meta"][i]
-                
+
         x1["meta"] = t["meta"]
         return x1
-
 
     def __getitem__(self, idx):
         # zhican
@@ -841,7 +862,7 @@ class VESMDataModule(L.LightningDataModule):
             "training stage 2",
             "training stage 1 + stage 2",
             "training stage 1 finetune",
-            "training stage 2 from embedding",            
+            "training stage 2 from embedding",
             "inference",
         ]
         self.stage = stage
@@ -858,17 +879,17 @@ class VESMDataModule(L.LightningDataModule):
         self.val_indices1 = []
 
         L.seed_everything(self.seed)
-        
+
         if val_data is not None:
             # --- 策略 A: 使用手动指定的验证集 ---
             print("--- 手动指定验证集模式 ---")
-            
+
             self.traindata1 = data1
             self.train_indices1 = [list(range(len(d))) for d in self.traindata1]
             print(f"训练集: {sum(len(d) for d in self.traindata1)} 个样本")
-            
+
             # --- 核心修改：将 val_data 包装在列表中 ---
-            self.valdata1 = [val_data] 
+            self.valdata1 = [val_data]
             self.val_indices1 = [list(range(len(d))) for d in self.valdata1]
             print(f"验证集: {sum(len(d) for d in self.valdata1)} 个样本")
 
@@ -899,7 +920,6 @@ class VESMDataModule(L.LightningDataModule):
                     self.valdata1.append(v1)
                     self.train_indices1.append(i1)
                     self.val_indices1.append(i2)
-
 
         # for i in data1:
         #     d1, v1, i1, i2 = train_test_split(
